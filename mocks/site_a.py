@@ -125,6 +125,10 @@ async def index():
             if b.status == "confirmed"
             else '<span style="color:#ef4444;font-weight:600">✗ 취소</span>'
         )
+        cancel_btn = (
+            f'<button class="btn-cancel" onclick="cancelBooking(\'{b.booking_id}\')">취소</button>'
+            if b.status == "confirmed" else ""
+        )
         rows += f"""
         <tr>
             <td>{b.booking_id[:8]}...</td>
@@ -132,6 +136,7 @@ async def index():
             <td>{b.check_in}</td>
             <td>{b.check_out}</td>
             <td>{status_badge}</td>
+            <td>{cancel_btn}</td>
         </tr>"""
 
     # ── 가용 현황 달력 ──
@@ -243,6 +248,20 @@ async def index():
         }}
         button:hover {{ opacity: 0.9; }}
         .empty {{ color: #64748b; text-align: center; padding: 2rem; }}
+        .btn-cancel {{
+            background: rgba(239, 68, 68, 0.15);
+            color: #f87171;
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            border-radius: 6px;
+            padding: 0.3rem 0.7rem;
+            font-size: 0.75rem;
+            cursor: pointer;
+            transition: all 0.2s;
+        }}
+        .btn-cancel:hover {{
+            background: rgba(239, 68, 68, 0.3);
+            color: #fca5a5;
+        }}
         .legend {{
             display: flex; gap: 1.5rem; margin-bottom: 0.5rem;
             font-size: 0.8rem; color: #94a3b8;
@@ -263,7 +282,7 @@ async def index():
 
         <div class="card">
             <h2>📋 예약 목록</h2>
-            <div id="booking-list">{"<table><thead><tr><th>ID</th><th>투숙객</th><th>체크인</th><th>체크아웃</th><th>상태</th></tr></thead><tbody>" + rows + "</tbody></table>" if rows else '<p class="empty">예약이 없습니다</p>'}</div>
+            <div id="booking-list">{"<table><thead><tr><th>ID</th><th>투숙객</th><th>체크인</th><th>체크아웃</th><th>상태</th><th></th></tr></thead><tbody>" + rows + "</tbody></table>" if rows else '<p class="empty">예약이 없습니다</p>'}</div>
         </div>
 
         <div class="card">
@@ -297,6 +316,21 @@ async def index():
             document.getElementById('booking-list').innerHTML = data.bookings_html;
         }} catch(e) {{}}
     }}, 5000);
+
+    async function cancelBooking(bookingId) {{
+        if (!confirm('이 예약을 취소하시겠습니까?')) return;
+        try {{
+            const resp = await fetch('/bookings/' + bookingId, {{method: 'DELETE'}});
+            if (resp.ok) {{
+                const partial = await fetch('/partial');
+                const data = await partial.json();
+                document.getElementById('calendar-section').innerHTML = '<h2>📅 가용 현황</h2>' + data.calendar_html;
+                document.getElementById('booking-list').innerHTML = data.bookings_html;
+            }}
+        }} catch(e) {{
+            alert('취소 실패: ' + e.message);
+        }}
+    }}
     </script>
 </body>
 </html>"""
@@ -347,15 +381,20 @@ def _build_bookings_html() -> str:
             if b.status == "confirmed"
             else '<span style="color:#ef4444;font-weight:600">✗ 취소</span>'
         )
+        cancel_btn = (
+            f'<button class="btn-cancel" onclick="cancelBooking(\'{b.booking_id}\')">취소</button>'
+            if b.status == "confirmed" else ""
+        )
         rows += (
             f"<tr><td>{b.booking_id[:8]}...</td>"
             f"<td>{b.guest_name}</td>"
             f"<td>{b.check_in}</td><td>{b.check_out}</td>"
-            f"<td>{status_badge}</td></tr>"
+            f"<td>{status_badge}</td>"
+            f"<td>{cancel_btn}</td></tr>"
         )
     return (
         "<table><thead><tr><th>ID</th><th>투숙객</th><th>체크인</th>"
-        "<th>체크아웃</th><th>상태</th></tr></thead><tbody>"
+        "<th>체크아웃</th><th>상태</th><th></th></tr></thead><tbody>"
         + rows + "</tbody></table>"
     )
 
