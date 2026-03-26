@@ -1,1 +1,2 @@
 .env
+./mocks/__pycache__/*
