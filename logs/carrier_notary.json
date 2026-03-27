@@ -1,0 +1,13 @@
+[
+  {
+    "timestamp": "2026-03-27T06:02:51.834997+00:00",
+    "event": "agent_registered",
+    "agent_id": "agent_001",
+    "sim_id": "sim_001",
+    "owner": "홍길동",
+    "policies": [
+      "booking_sync"
+    ],
+    "expires_at": "2027-03-27T06:02:51.834831+00:00"
+  }
+]

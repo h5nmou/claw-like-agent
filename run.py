@@ -16,6 +16,16 @@ os.chdir(PROJECT_ROOT)
 import uvicorn
 
 
+def run_telco():
+    print("🔐 Starting Telco Trust Server on port 8003...")
+    uvicorn.run("mocks.telco_server:app", host="0.0.0.0", port=8003, log_level="info")
+
+
+def run_telco_app():
+    print("📱 Starting Telco App UI on port 8004...")
+    uvicorn.run("mocks.telco_app_ui:app", host="0.0.0.0", port=8004, log_level="info")
+
+
 def run_site_b():
     print("🟢 Starting Mock Site B on port 8002...")
     uvicorn.run("mocks.site_b:app", host="0.0.0.0", port=8002, log_level="info")
@@ -33,6 +43,8 @@ def run_site_a():
 
 if __name__ == "__main__":
     processes = [
+        multiprocessing.Process(target=run_telco),
+        multiprocessing.Process(target=run_telco_app),
         multiprocessing.Process(target=run_site_b),
         multiprocessing.Process(target=run_engine),
         multiprocessing.Process(target=run_site_a),

@@ -22,10 +22,12 @@ from dotenv import load_dotenv
 from core.brain import Brain
 from core.executor import execute, build_function_schemas
 from core.memory import Memory
+from core.onboarding_manager import OnboardingManager
 
 # Tool 모듈을 import하여 @tool 데코레이터가 실행되도록 함
 import tools.site_a_api  # noqa: F401
 import tools.site_b_api  # noqa: F401
+import tools.telco_auth_api  # noqa: F401
 
 load_dotenv()
 
@@ -39,7 +41,34 @@ logger = logging.getLogger("engine")
 
 # ── FastAPI 앱 ───────────────────────────────────────
 
-app = FastAPI(title="Universal Agent Engine", version="0.1.0")
+app = FastAPI(title="Universal Agent Engine", version="0.2.0")
+onboarding_mgr = OnboardingManager()
+
+
+@app.on_event("startup")
+async def startup_onboarding():
+    """엔진 시작 시 온보딩 상태 확인."""
+    if onboarding_mgr.needs_onboarding():
+        logger.info("온보딩 필요 — RSA Keypair 생성 및 통신사 앱에 승인 요청")
+        public_key_pem = onboarding_mgr.generate_keypair()
+        # 통신사 앱(Mock)에 대기 정보 전송
+        import httpx
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    "http://localhost:8004/pending",
+                    json={
+                        "public_key": public_key_pem,
+                        "requested_policies": ["booking_sync"],
+                    },
+                    timeout=5.0,
+                )
+            logger.info("통신사 앱에 승인 요청 전송 완료 — http://localhost:8004 에서 승인 대기 중")
+        except Exception as e:
+            logger.warning(f"통신사 앱 연결 실패: {e} — 수동 온보딩 필요")
+    else:
+        agent_id = onboarding_mgr.get_agent_id()
+        logger.info(f"온보딩 완료 상태 — Agent ID: {agent_id}")
 
 # ── SSE 로그 브로드캐스터 ─────────────────────────────
 
@@ -565,3 +594,25 @@ async def manual_run(request: Request):
     event = await request.json()
     result = await run_agent_loop(event)
     return JSONResponse(content=result)
+
+
+@app.post("/onboarding/complete")
+async def onboarding_complete(request: Request):
+    """통신사 앱에서 승인 완료 후 위임장 수신."""
+    data = await request.json()
+    cert = data.get("delegation_certificate", {})
+    telco_pub = data.get("telco_public_key", "")
+
+    onboarding_mgr.save_certificate(cert, telco_pub)
+    agent_id = cert.get("agent_id", "N/A")
+    logger.info(f"온보딩 완료: Agent ID = {agent_id}")
+    await broadcaster.emit("system", f"✅ 온보딩 완료! Agent ID: {agent_id}\n정책: {cert.get('policies', [])}", "🎉 온보딩")
+
+    return {"status": "onboarded", "agent_id": agent_id}
+
+
+@app.post("/onboarding/reset")
+async def onboarding_reset():
+    """온보딩 초기화 (디버깅용)."""
+    onboarding_mgr.reset()
+    return {"status": "reset"}

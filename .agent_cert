@@ -1,0 +1,11 @@
+{
+  "agent_id": "agent_001",
+  "sim_id": "sim_001",
+  "owner": "홍길동",
+  "carrier": "SKT",
+  "policies": [
+    "booking_sync"
+  ],
+  "issued_at": "2026-03-27T06:02:51.834831+00:00",
+  "expires_at": "2027-03-27T06:02:51.834831+00:00"
+}
