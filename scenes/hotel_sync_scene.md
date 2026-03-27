@@ -20,7 +20,12 @@
    - `action`: 수행할 작업 ("block" 또는 "unblock")
    - `resource`: 대상 객실 (예: "room_101")  
    - `target_site`: "site_b"
-7. 토큰을 발급받은 후, `block_site_b_dates_with_token` 또는 `unblock_site_b_dates_with_token`으로 재시도하세요.
+7. 토큰을 발급받으면 응답에 `token`과 `vpal_session_id`가 포함됩니다.
+8. `block_site_b_dates_with_token` 또는 `unblock_site_b_dates_with_token`으로 재시도할 때, **token과 vpal_session_id를 모두** 전달하세요.
+
+### VPAL (Virtual Private Agent Link)
+9. 모든 Site B 변경 요청은 VPAL 사설 네트워크 터널을 통해 전달됩니다.
+10. `vpal_session_id`는 터널 식별자로, 토큰과 함께 이중 검증됩니다.
 
 ### 제약 조건
 - 예약 데이터의 `room_id`, `check_in`, `check_out` 필드는 필수입니다.

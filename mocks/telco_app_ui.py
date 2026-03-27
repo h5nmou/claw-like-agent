@@ -170,7 +170,6 @@ async def index():
         .result {{ text-align: center; padding: 2rem; }}
         .result .icon {{ font-size: 3rem; margin-bottom: 1rem; }}
     </style>
-    <meta http-equiv="refresh" content="3">
 </head>
 <body>
     <div class="container">
@@ -180,6 +179,12 @@ async def index():
         </div>
         {body}
     </div>
+    <script>
+        // 승인 폼이 없을 때만 자동 새로고침 (폼 입력 중엔 새로고침 안 함)
+        if (!document.querySelector('form')) {{
+            setTimeout(function() {{ location.reload(); }}, 3000);
+        }}
+    </script>
 </body>
 </html>"""
     return HTMLResponse(content=html)

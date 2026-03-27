@@ -90,14 +90,15 @@ async def unblock_site_b_dates(room_id: str, check_in: str, check_out: str) -> d
 
 
 @tool
-async def block_site_b_dates_with_token(room_id: str, check_in: str, check_out: str, token: str) -> dict:
-    """인증 토큰을 포함하여 사이트 B의 특정 객실·날짜 범위를 예약 불가로 변경합니다. get_telco_auth_token으로 발급받은 토큰을 사용하세요.
+async def block_site_b_dates_with_token(room_id: str, check_in: str, check_out: str, token: str, vpal_session_id: str) -> dict:
+    """인증 토큰과 VPAL 세션을 포함하여 사이트 B의 특정 객실·날짜 범위를 예약 불가로 변경합니다. get_telco_auth_token으로 발급받은 token과 vpal_session_id를 모두 사용하세요.
 
     Args:
         room_id: 객실 ID (예: "room_101")
         check_in: 체크인 날짜 (YYYY-MM-DD)
         check_out: 체크아웃 날짜 (YYYY-MM-DD)
-        token: Telco Auth Server에서 발급받은 JWT 토큰
+        token: Telco Trust Server에서 발급받은 JWT 토큰
+        vpal_session_id: Telco에서 발급받은 VPAL 세션 ID
 
     Returns:
         변경 결과를 포함하는 dict
@@ -106,7 +107,10 @@ async def block_site_b_dates_with_token(room_id: str, check_in: str, check_out: 
         resp = await client.patch(
             f"{SITE_B_URL}/rooms/{room_id}/availability",
             json={"check_in": check_in, "check_out": check_out, "available": False},
-            headers={"Authorization": f"Bearer {token}"},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "X-VPAL-Session": vpal_session_id,
+            },
             timeout=10.0,
         )
         if resp.status_code == 401:
@@ -118,14 +122,15 @@ async def block_site_b_dates_with_token(room_id: str, check_in: str, check_out: 
 
 
 @tool
-async def unblock_site_b_dates_with_token(room_id: str, check_in: str, check_out: str, token: str) -> dict:
-    """인증 토큰을 포함하여 사이트 B의 특정 객실·날짜 범위를 예약 가능으로 변경합니다. get_telco_auth_token으로 발급받은 토큰을 사용하세요.
+async def unblock_site_b_dates_with_token(room_id: str, check_in: str, check_out: str, token: str, vpal_session_id: str) -> dict:
+    """인증 토큰과 VPAL 세션을 포함하여 사이트 B의 특정 객실·날짜 범위를 예약 가능으로 변경합니다. get_telco_auth_token으로 발급받은 token과 vpal_session_id를 모두 사용하세요.
 
     Args:
         room_id: 객실 ID (예: "room_101")
         check_in: 체크인 날짜 (YYYY-MM-DD)
         check_out: 체크아웃 날짜 (YYYY-MM-DD)
-        token: Telco Auth Server에서 발급받은 JWT 토큰
+        token: Telco Trust Server에서 발급받은 JWT 토큰
+        vpal_session_id: Telco에서 발급받은 VPAL 세션 ID
 
     Returns:
         변경 결과를 포함하는 dict
@@ -134,7 +139,10 @@ async def unblock_site_b_dates_with_token(room_id: str, check_in: str, check_out
         resp = await client.patch(
             f"{SITE_B_URL}/rooms/{room_id}/availability",
             json={"check_in": check_in, "check_out": check_out, "available": True},
-            headers={"Authorization": f"Bearer {token}"},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "X-VPAL-Session": vpal_session_id,
+            },
             timeout=10.0,
         )
         if resp.status_code == 401:

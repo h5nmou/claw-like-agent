@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import logging
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -66,7 +67,15 @@ REGISTERED_SIMS = {
 # ── Agent 등록 DB ────────────────────────────────────
 
 registered_agents: dict[str, dict] = {}
-#  {agent_id: {public_key_pem, policies, sim_id, owner, registered_at, expires_at}}
+#  {agent_id: {public_key_pem, policies, sim_id, owner, registered_at, expires_at, status}}
+
+# ── VPAL 세션 & 트래픽 모니터링 ──────────────────────
+
+vpal_sessions: dict[str, dict] = {}
+#  {agent_id: {session_id, created_at, request_count, last_request}}
+
+isolated_agents: set[str] = set()
+#  Kill-switch로 격리된 Agent
 
 # ── 공증 기록 ────────────────────────────────────────
 
@@ -246,7 +255,47 @@ async def issue_token(req: TokenRequest):
             "message": f"요청된 action={req.action}, resource={req.resource}에 대한 권한이 없습니다.",
         })
 
-    # 4. JWT 생성 (RS256)
+    # 4. Kill-switch 확인
+    if req.agent_id in isolated_agents:
+        _append_notary("token_denied_isolated", {
+            "agent_id": req.agent_id,
+            "reason": "agent_isolated",
+        })
+        return JSONResponse(status_code=403, content={
+            "error": "Agent isolated",
+            "message": "Kill-switch가 발동되어 격리된 Agent입니다. 통신사 앱에서 재활성화하세요.",
+        })
+
+    # 5. 트래픽 모니터링 (Rate Limit)
+    vpal = vpal_sessions.get(req.agent_id)
+    if vpal:
+        vpal["request_count"] += 1
+        vpal["last_request"] = now.isoformat()
+        max_rph = AVAILABLE_POLICIES.get(policy_matched, {}).get("constraints", {}).get("max_requests_per_hour", 100)
+        if vpal["request_count"] > max_rph:
+            isolated_agents.add(req.agent_id)
+            _append_notary("agent_isolated", {
+                "agent_id": req.agent_id,
+                "reason": "rate_limit_exceeded",
+                "requests_count": vpal["request_count"],
+                "policy_limit": max_rph,
+                "action_taken": "vpal_session_revoked",
+            })
+            logger.warning(f"Kill-switch 발동: {req.agent_id} (rate={vpal['request_count']}/{max_rph})")
+            return JSONResponse(status_code=403, content={
+                "error": "Kill-switch activated",
+                "message": f"비정상 요청 빈도 감지 ({vpal['request_count']}/{max_rph}). Agent가 격리되었습니다.",
+            })
+    else:
+        vpal_sessions[req.agent_id] = {
+            "session_id": str(uuid.uuid4()),
+            "created_at": now.isoformat(),
+            "request_count": 1,
+            "last_request": now.isoformat(),
+        }
+        vpal = vpal_sessions[req.agent_id]
+
+    # 6. JWT 생성 (RS256 + VPAL 세션)
     payload = {
         "agent_id": req.agent_id,
         "sim_id": agent["sim_id"],
@@ -256,6 +305,7 @@ async def issue_token(req: TokenRequest):
         "resource": req.resource,
         "target_site": req.target_site,
         "policy": policy_matched,
+        "vpal_session_id": vpal["session_id"],
         "iat": now,
         "exp": now + timedelta(minutes=5),
         "jti": f"{req.agent_id}-{now.timestamp()}",
@@ -277,6 +327,7 @@ async def issue_token(req: TokenRequest):
 
     return {
         "token": token,
+        "vpal_session_id": vpal["session_id"],
         "expires_in": 300,
         "token_type": "Bearer",
         "policy_matched": policy_matched,
@@ -295,6 +346,56 @@ async def get_notary():
 @app.get("/public-key")
 async def get_public_key():
     return {"telco_public_key": TELCO_PUBLIC_PEM}
+
+
+@app.post("/killswitch/{agent_id}/isolate")
+async def killswitch_isolate(agent_id: str):
+    """Kill-switch: Agent 즉시 격리."""
+    isolated_agents.add(agent_id)
+    if agent_id in vpal_sessions:
+        del vpal_sessions[agent_id]
+    _append_notary("agent_isolated", {
+        "agent_id": agent_id,
+        "reason": "manual_killswitch",
+        "action_taken": "vpal_session_revoked",
+    })
+    logger.warning(f"Kill-switch 수동 발동: {agent_id}")
+    return {"status": "isolated", "agent_id": agent_id}
+
+
+@app.post("/killswitch/{agent_id}/reactivate")
+async def killswitch_reactivate(agent_id: str, data: dict):
+    """Kill-switch 해제: USIM PIN 재인증 필요."""
+    sim_pin = data.get("sim_pin", "")
+    agent = registered_agents.get(agent_id)
+    if not agent:
+        return JSONResponse(status_code=404, content={"error": "Agent not found"})
+    sim = REGISTERED_SIMS.get(agent["sim_id"])
+    if not sim or sim["pin"] != sim_pin:
+        return JSONResponse(status_code=403, content={"error": "Invalid SIM PIN"})
+    isolated_agents.discard(agent_id)
+    vpal_sessions[agent_id] = {
+        "session_id": str(uuid.uuid4()),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "request_count": 0,
+        "last_request": None,
+    }
+    _append_notary("agent_reactivated", {
+        "agent_id": agent_id,
+        "new_vpal_session": vpal_sessions[agent_id]["session_id"],
+    })
+    return {"status": "reactivated", "agent_id": agent_id}
+
+
+@app.get("/traffic/{agent_id}")
+async def traffic_monitor(agent_id: str):
+    """Agent 트래픽 모니터링 현황."""
+    vpal = vpal_sessions.get(agent_id)
+    return {
+        "agent_id": agent_id,
+        "vpal_session": vpal,
+        "isolated": agent_id in isolated_agents,
+    }
 
 
 # ── Dashboard UI ─────────────────────────────────────

@@ -1,6 +1,6 @@
 [
   {
-    "timestamp": "2026-03-27T06:02:51.834997+00:00",
+    "timestamp": "2026-03-27T06:55:37.129967+00:00",
     "event": "agent_registered",
     "agent_id": "agent_001",
     "sim_id": "sim_001",
@@ -8,6 +8,16 @@
     "policies": [
       "booking_sync"
     ],
-    "expires_at": "2027-03-27T06:02:51.834831+00:00"
+    "expires_at": "2027-03-27T06:55:37.129805+00:00"
+  },
+  {
+    "timestamp": "2026-03-27T06:55:59.721627+00:00",
+    "event": "token_issued",
+    "agent_id": "agent_001",
+    "owner": "홍길동",
+    "action": "block",
+    "resource": "room_101",
+    "policy_matched": "booking_sync",
+    "token_jti": "agent_001-1774594559.716993"
   }
 ]

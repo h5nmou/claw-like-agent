@@ -28,43 +28,56 @@ app = FastAPI(title="Mock Site B - Guardian Agent", version="0.2.0")
 _telco_public_key = None
 
 
-@app.on_event("startup")
-async def fetch_telco_public_key():
-    """Telco Trust Server에서 Public Key를 가져와 검증에 사용."""
+async def _ensure_telco_key():
+    """Telco Public Key가 없으면 가져오기를 시도."""
     global _telco_public_key
+    if _telco_public_key is not None:
+        return True
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.get("http://localhost:8003/public-key", timeout=5.0)
+            resp = await client.get("http://localhost:8003/public-key", timeout=3.0)
             if resp.status_code == 200:
                 pem = resp.json()["telco_public_key"]
                 _telco_public_key = load_pem_public_key(pem.encode("utf-8"))
                 logger.info("Telco Public Key 로드 완료 (RS256 검증 활성화)")
-            else:
-                logger.warning("Telco Public Key 로드 실패 — HS256 fallback")
+                return True
     except Exception as e:
-        logger.warning(f"Telco 서버 미접속 — Public Key 없이 시작: {e}")
+        logger.warning(f"Telco Public Key 로드 실패: {e}")
+    return False
 
 
-def verify_token(request: Request) -> dict | None:
-    """Authorization 헤더에서 JWT를 RS256으로 검증."""
+async def verify_token(request: Request) -> dict | None:
+    """Authorization 헤더에서 JWT RS256 검증 + VPAL 세션 이중 검증."""
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
         return None
     token = auth_header[7:]
 
+    # Lazy loading: 키가 없으면 지금 가져오기 시도
     if _telco_public_key is None:
-        logger.warning("Telco Public Key 없음 — 인증 불가")
-        return None
+        loaded = await _ensure_telco_key()
+        if not loaded:
+            logger.warning("Telco Public Key 없음 — 인증 불가")
+            return None
 
     try:
         payload = jwt.decode(token, _telco_public_key, algorithms=["RS256"])
-        return payload
     except jwt.ExpiredSignatureError:
         logger.warning("Token expired")
         return None
     except jwt.InvalidTokenError as e:
         logger.warning(f"Invalid token: {e}")
         return None
+
+    # VPAL 세션 이중 검증
+    vpal_header = request.headers.get("X-VPAL-Session", "")
+    vpal_in_token = payload.get("vpal_session_id", "")
+    if vpal_in_token and vpal_header != vpal_in_token:
+        logger.warning(f"VPAL 세션 불일치: header={vpal_header}, token={vpal_in_token}")
+        return None
+
+    logger.info(f"VPAL 검증 통과: session={vpal_header[:8]}...")
+    return payload
 
 
 # ── 데이터 모델 ──────────────────────────────────────
@@ -212,7 +225,7 @@ async def get_availability(room_id: str, check_in: str = Query(None), check_out:
 @app.patch("/rooms/{room_id}/availability")
 async def update_availability(room_id: str, req: AvailabilityUpdate, request: Request):
     """가용 상태 변경 — Telco RS256 JWT 인증 필수."""
-    payload = verify_token(request)
+    payload = await verify_token(request)
     if payload is None:
         logger.warning(f"Unauthorized PATCH attempt for {room_id}")
         return JSONResponse(
