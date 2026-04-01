@@ -23,6 +23,8 @@ from core.brain import Brain
 from core.executor import execute, build_function_schemas
 from core.memory import Memory
 from core.onboarding_manager import OnboardingManager
+from core.mcp_client import MCPClient
+from core.telegram_client import telegram_client
 
 # Tool 모듈을 import하여 @tool 데코레이터가 실행되도록 함
 import tools.site_a_api  # noqa: F401
@@ -43,6 +45,11 @@ logger = logging.getLogger("engine")
 
 app = FastAPI(title="Universal Agent Engine", version="0.2.0")
 onboarding_mgr = OnboardingManager()
+
+# Phone-MCP 설정
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://192.168.0.20:8080")
+mcp_client = MCPClient(MCP_SERVER_URL)
+
 
 
 @app.on_event("startup")
@@ -69,6 +76,66 @@ async def startup_onboarding():
     else:
         agent_id = onboarding_mgr.get_agent_id()
         logger.info(f"온보딩 완료 상태 — Agent ID: {agent_id}")
+
+
+@app.on_event("startup")
+async def startup_mcp_tools():
+    """Phone-MCP 서버에서 원격 Tool 목록 동기화."""
+    await broadcaster.emit("divider", "PHASE 0.5 — Phone-MCP 연동", "")
+    await broadcaster.emit("system", f"📱 Phone-MCP ({MCP_SERVER_URL}) 연결 시도 중...", "⚙️ MCP 연동")
+    
+    # Tool 목록 가져오기 및 등록
+    await mcp_client.fetch_and_register_tools()
+    
+    # 등록된 도구 확인을 위해 잠시 대기
+    from core.executor import get_registered_tools
+    all_tools = get_registered_tools()
+    logger.info(f"Final tool registry: {all_tools}")
+    await broadcaster.emit("system", f"✅ Phone-MCP 연동 완료 — 전체 도구 수: {len(all_tools)}개", "⚙️ MCP 연동")
+
+
+# ── Telegram 봇 연동 ────────────────────────────────
+async def handle_telegram_message(text: str, chat_id: str):
+    """텔레그램에서 수신된 메시지를 에이전트 루프로 전달."""
+    logger.info(f"Processing telegram message from {chat_id}: {text}")
+    await broadcaster.emit("webhook", {"source": "Telegram", "msg": text}, "📲 Telegram 수신")
+    
+    event = {
+        "event": "user_command",
+        "timestamp": datetime.utcnow().isoformat(),
+        "source": "telegram",
+        "chat_id": chat_id,
+        "message": text
+    }
+    
+    # 에이전트 루프 실행
+    result = await run_agent_loop(event)
+    
+    # 에이전트가 처리한 최종 요약본을 텔레그램으로 답장 발송
+    # 단, 에이전트가 직접 send_telegram_message 추가 툴을 호출하여 이미 버튼이나 메세지를 보냈다면 중복 발송 생략
+    history = result.get("history", [])
+    used_tg_tool = any(
+        item.get("type") == "tool" and item.get("name") == "send_telegram_message" 
+        for item in history
+    )
+    
+    if not used_tg_tool:
+        final_reply = result.get("summary", "명령을 수행했습니다.")
+        await telegram_client.send_message(final_reply, user_id=chat_id)
+
+
+@app.on_event("startup")
+async def startup_telegram_bot():
+    """엔진 시작 시 텔레그램 메세지 수신 시작 (백그라운드)"""
+    # 텔레그램 토큰이 설정되어 있으면 폴링 Task 생성
+    asyncio.create_task(telegram_client.start_polling(handle_telegram_message))
+
+
+@app.on_event("shutdown")
+async def shutdown_telegram_bot():
+    """엔진 종료 시 텔레그램 폴링 중지"""
+    telegram_client.stop_polling()
+
 
 # ── SSE 로그 브로드캐스터 ─────────────────────────────
 
@@ -104,21 +171,39 @@ class LogBroadcaster:
     def get_history(self) -> list[dict]:
         return list(self._history)
 
+    def clear_history(self) -> None:
+        self._history.clear()
+
 
 broadcaster = LogBroadcaster()
 
 # ── Scene 로드 ───────────────────────────────────────
 
-SCENE_PATH = os.getenv(
-    "SCENE_PATH",
-    str(Path(__file__).resolve().parent.parent / "scenes" / "hotel_sync_scene.md"),
+SCENE_DIR = os.getenv(
+    "SCENE_DIR",
+    str(Path(__file__).resolve().parent.parent / "scenes")
 )
 
 
-def load_scene(path: str) -> str:
-    """Scene(.md) 파일을 읽어 system prompt 문자열로 반환."""
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
+def load_all_scenes(directory: str) -> str:
+    """scenes/ 디렉토리 내의 모든 .md 파일을 읽어 하나의 강력한 지침으로 병합."""
+    all_content = []
+    logger.info(f"Scanning for scenes in {directory}...")
+    
+    # 디렉토리 내의 모든 .md 파일 로드
+    scene_files = list(Path(directory).glob("*.md"))
+    if not scene_files:
+        logger.warning(f"No scene files found in {directory}!")
+        return "You are a helpful AI assistant."
+
+    for scene_file in sorted(scene_files):  # 정렬하여 일관된 순서 유지
+        logger.info(f"Loading scene: {scene_file.name}")
+        with open(scene_file, "r", encoding="utf-8") as f:
+            content = f.read()
+            # 메타데이터 구분선 추가 (LLM이 각 씬의 맥락을 이해하는 데 도움)
+            all_content.append(f"\n--- Scene: {scene_file.stem} ---\n{content}")
+    
+    return "\n".join(all_content)
 
 
 # ── 메인 에이전트 루프 ───────────────────────────────
@@ -132,10 +217,15 @@ async def run_agent_loop(trigger_event: dict) -> dict:
     """
     # ── Phase 1: Scene 로드 ──
     await broadcaster.emit("divider", "PHASE 1 — Scene 로드", "")
-    await broadcaster.emit("system", "📄 Scene 파일 로드 중...", "⚙️ 초기화")
-    system_prompt = load_scene(SCENE_PATH)
+    await broadcaster.emit("system", f"📂 Scene 디렉토리({SCENE_DIR}) 로드 중...", "⚙️ 초기화")
+    system_prompt = load_all_scenes(SCENE_DIR)
+    
+    # 로드된 씬 목록 확인용 로그
+    scene_list = [p.name for p in Path(SCENE_DIR).glob("*.md")]
+    await broadcaster.emit("system", f"✅ 로드된 시나리오: {', '.join(scene_list)}", "⚙️ Scene 로드")
+    
     scene_preview = system_prompt[:500] + ("..." if len(system_prompt) > 500 else "")
-    await broadcaster.emit("scene", scene_preview, "📜 Scene → System Prompt")
+    await broadcaster.emit("scene", scene_preview, "📜 Composite System Prompt")
 
     # ── Phase 2: Tool 스캐닝 ──
     await broadcaster.emit("divider", "PHASE 2 — Tool 등록", "")
@@ -221,6 +311,8 @@ async def run_agent_loop(trigger_event: dict) -> dict:
                     role_label = "[SITE B]"
                 elif "site_a" in tool_name:
                     role_label = "[SITE A]"
+                elif "mcp" in tool_name or tool_name in ["camera", "gps", "sms", "phone"]:  # Phone-MCP 도구 감지
+                    role_label = "[PHONE]"
                 else:
                     role_label = "[AGENT C]"
 
@@ -275,6 +367,31 @@ async def run_agent_loop(trigger_event: dict) -> dict:
     }
 
 
+@app.post("/chat")
+async def chat(request: Request):
+    """대시보드 채팅창에서 보낸 명령 처리."""
+    data = await request.json()
+    user_message = data.get("message", "")
+    
+    if not user_message:
+        return {"error": "No message provided"}
+    
+    logger.info(f"Chat command received: {user_message}")
+    
+    # 에이전트 루프 실행 (트리거 이벤트를 채팅 메시지로 설정)
+    event = {
+        "event": "user_command",
+        "timestamp": datetime.utcnow().isoformat(),
+        "source": "dashboard_chat",
+        "message": user_message
+    }
+    
+    result = await run_agent_loop(event)
+    
+    return {"response": result.get("summary", "작업을 완료했습니다.")}
+
+
+
 # ── API 엔드포인트 ───────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
@@ -292,7 +409,8 @@ async def dashboard():
             font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', monospace;
             background: #0a0e17;
             color: #c9d1d9;
-            min-height: 100vh;
+            height: 100vh;
+            overflow: hidden;
             display: flex;
             flex-direction: column;
         }
@@ -367,14 +485,56 @@ async def dashboard():
         .flow-dot:nth-child(3) { animation-delay: 0.6s; }
 
         /* ── Main Layout ── */
-        .main-content { display: flex; flex: 1; overflow: hidden; }
+        .main-content { display: flex; flex: 1; overflow: hidden; position: relative; }
         .log-panel { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+        
+        /* ── Chat Panel ── */
+        .chat-panel { 
+            flex: 1.5; background: #0d1117; display: flex; flex-direction: column; 
+            border-right: 1px solid #21262d; flex-shrink: 0;
+        }
+        .chat-header {
+            padding: 0.6rem 1.2rem; background: rgba(188, 140, 255, 0.05); 
+            border-bottom: 1px solid #21262d; font-size: 0.8rem; font-weight: 700;
+            color: #bc8cff; display: flex; align-items: center; gap: 0.5rem;
+        }
+        .chat-body { flex: 1; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: 1rem; }
+        .chat-input-area { 
+            padding: 1rem; background: #161b22; border-top: 1px solid #21262d;
+            display: flex; flex-direction: column; gap: 0.6rem;
+        }
+        .chat-input {
+            width: 100%; background: #0a0e17; border: 1px solid #30363d; border-radius: 6px;
+            padding: 0.6rem 0.8rem; color: #c9d1d9; font-size: 0.8rem; resize: none;
+            outline: none; transition: border-color 0.2s;
+        }
+        .chat-input:focus { border-color: #bc8cff; }
+        .chat-btn {
+            background: #bc8cff; color: #0a0e17; border: none; border-radius: 6px;
+            padding: 0.5rem; font-weight: 700; font-size: 0.75rem; cursor: pointer;
+            transition: opacity 0.2s, transform 0.1s;
+        }
+        .chat-btn:hover { opacity: 0.9; }
+        .chat-btn:active { transform: scale(0.98); }
+        .chat-msg { 
+            padding: 0.6rem 0.8rem; border-radius: 12px; font-size: 0.75rem; max-width: 85%;
+            animation: slideIn 0.3s ease-out;
+        }
+        @keyframes slideIn { from { opacity: 0; transform: translateX(10px); } to { opacity: 1; transform: translateX(0); } }
+        .msg-user { align-self: flex-end; background: #21262d; color: #c9d1d9; border-bottom-right-radius: 2px; }
+        .msg-agent { align-self: flex-start; background: rgba(188, 140, 255, 0.1); color: #bc8cff; border-bottom-left-radius: 2px; border: 1px solid rgba(188, 140, 255, 0.2); }
+
         .log-header {
             padding: 0.5rem 1.5rem; background: #0d1117; border-bottom: 1px solid #21262d;
             display: flex; justify-content: space-between; align-items: center;
-            font-size: 0.75rem; color: #8b949e;
+            font-size: 0.75rem; color: #8b949e; cursor: pointer; user-select: none;
+            transition: background 0.2s;
         }
+        .log-header:hover { background: #161b22; }
+        .log-header-title { display: flex; align-items: center; gap: 0.4rem; }
+        .toggle-icon { display: inline-block; transition: transform 0.2s; font-size: 0.6rem; }
         .log-container { flex: 1; overflow-y: auto; padding: 0.5rem 1.5rem; }
+        .log-container.collapsed { display: none; }
 
         .log-entry {
             display: flex; gap: 0.5rem; padding: 0.35rem 0.6rem; margin-bottom: 0.15rem;
@@ -513,18 +673,33 @@ async def dashboard():
         </div>
     </div>
 
-    <!-- Log Panel -->
     <div class="main-content">
+        <!-- Chat Sidebar -->
+        <div class="chat-panel">
+            <div class="chat-header">💬 Agent Command Center</div>
+            <div class="chat-body" id="chatBody">
+                <div class="chat-msg msg-agent">반갑습니다. 에이전트 C입니다. Phone-MCP가 연결되었습니다. 어떤 작업을 도와드릴까요?</div>
+            </div>
+            <div class="chat-input-area">
+                <textarea class="chat-input" id="chatInput" placeholder="에이전트에게 명령을 입력하세요... (Shift+Enter로 줄바꿈)" rows="2"></textarea>
+                <button class="chat-btn" onclick="sendChatMessage()">전송 (Enter)</button>
+                <button class="chat-btn" style="background:transparent; border:1px solid #30363d; color:#8b949e; font-size:0.6rem;" onclick="clearLogs()">로그 초기화</button>
+            </div>
+        </div>
+        <!-- Log Panel -->
         <div class="log-panel">
-            <div class="log-header">
-                <span>🔍 실시간 Semantic Log</span>
+            <div class="log-header" onclick="toggleLogPanel()">
+                <div class="log-header-title">
+                    <span class="toggle-icon" id="logToggleIcon">▶</span>
+                    <span>🔍 실시간 Semantic Log</span>
+                </div>
                 <span><span id="logCount">0</span>건</span>
             </div>
-            <div class="log-container" id="logContainer">
+            <div class="log-container collapsed" id="logContainer">
                 <div class="empty-state" id="emptyState">
                     <div class="icon">📡</div>
-                    <p>Webhook 이벤트 대기 중...</p>
-                    <p style="font-size:0.72rem;">Site A에서 예약을 생성하면 [SITE A] → [AGENT C] → [TELCO D] → [SITE B] 흐름이 표시됩니다</p>
+                    <p>시스템 이벤트 대기 중...</p>
+                    <p style="font-size:0.72rem;">채팅창에 명령을 입력하거나 Site A에서 이벤트를 생성하세요.</p>
                 </div>
             </div>
         </div>
@@ -568,6 +743,68 @@ async def dashboard():
 
         function updateClock() { clock.textContent = new Date().toLocaleTimeString('ko-KR'); }
         setInterval(updateClock, 1000); updateClock();
+
+        const chatBody = document.getElementById('chatBody');
+        const chatInput = document.getElementById('chatInput');
+
+        async function sendChatMessage() {
+            const text = chatInput.value.trim();
+            if (!text) return;
+            
+            chatInput.value = '';
+            appendChatMessage('user', text);
+            statusText.textContent = '처리 중...';
+            statusDot.style.background = '#f59e0b';
+
+            try {
+                const response = await fetch('/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message: text })
+                });
+                const data = await response.json();
+                appendChatMessage('agent', data.response || '작업을 수행했습니다.');
+            } catch (err) {
+                appendChatMessage('agent', '에러: 서버와 통신할 수 없습니다.');
+            } finally {
+                statusText.textContent = '대기 중';
+                statusDot.style.background = '#3fb950';
+            }
+        }
+
+        function appendChatMessage(role, text) {
+            const div = document.createElement('div');
+            div.className = 'chat-msg msg-' + role;
+            div.textContent = text;
+            chatBody.appendChild(div);
+            chatBody.scrollTop = chatBody.scrollHeight;
+        }
+
+        async function clearLogs() {
+            try { await fetch('/logs/clear', { method: 'POST' }); } catch(err) {}
+            Array.from(container.children).forEach(child => {
+                if (child !== emptyState) container.removeChild(child);
+            });
+            if (emptyState) emptyState.style.display = 'flex';
+            count = 0;
+            logCount.textContent = '0';
+        }
+
+        function toggleLogPanel() {
+            const isCollapsed = container.classList.toggle('collapsed');
+            const icon = document.getElementById('logToggleIcon');
+            icon.textContent = isCollapsed ? '▶' : '▼';
+        }
+
+        chatInput.addEventListener('keydown', (e) => {
+            // 한글 조합 중 엔터 키 중복 발생 방지
+            if (e.isComposing || e.keyCode === 229) return;
+
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendChatMessage();
+            }
+        });
 
         function addLog(entry) {
             if (emptyState) emptyState.style.display = 'none';
@@ -668,9 +905,15 @@ async def log_stream(request: Request):
 
 
 @app.get("/logs/history")
-async def log_history():
-    """기존 로그 히스토리 반환."""
-    return JSONResponse(content=broadcaster.get_history())
+async def get_log_history():
+    """지금까지의 로그 히스토리 반환."""
+    return broadcaster.get_history()
+
+@app.post("/logs/clear")
+async def clear_logs():
+    """로그 내역을 완전 초기화합니다."""
+    broadcaster.clear_history()
+    return {"status": "success"}
 
 
 @app.post("/webhook")

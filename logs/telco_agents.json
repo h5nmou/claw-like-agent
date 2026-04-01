@@ -1,0 +1,35 @@
+{
+  "agent_001": {
+    "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArLlboIkd/r+5x0YHtFIe\nI/1agFWQYsRN/STWVFfi2o6K14opBajZC7Hbtk29iG9hTsGPPhJHMiouZhrFLieS\nWrl32Cxjs3Vv3odsDGuqO12qN+Vg9+HlF4az2wSy3efgX2dme7mhIDZPgaU8KeoB\n1WEM5sYLdQii7NFL80D5Y8OpemdISQn0VTxS5RCkFkAHyoD262+2mnX0r5IE2wlw\ntAeMKtC1YVXIhQE6UWuPMSnJ/VuC10JEPwm1auUVs96YVbePLcSn5eFPLEl26SO4\nuoTtWL3A9c+5JDUZp8F60uE0xb+nac/ZM71S58LA9Gq7Hsy34D6ukb8Cwb6hVRHi\nBwIDAQAB\n-----END PUBLIC KEY-----\n",
+    "policies": [
+      "booking_sync"
+    ],
+    "sim_id": "sim_001",
+    "owner": "홍길동",
+    "carrier": "SKT",
+    "registered_at": "2026-04-01T01:23:41.724470+00:00",
+    "expires_at": "2027-04-01T01:23:41.724470+00:00"
+  },
+  "agent_002": {
+    "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtujPZfL1E0LWgDY/zvsm\nkbBlfFbAwgJtR63MIVaAu6xVvwMwdqIu63K+Mi0KtNsnZkQ9iadwlnju4IGeoEzP\nIiHAAn1QPPF68K4n7Kgeu+7jdrIc/taGNBTiaCC6Smy8DAJMfvYRZFqV+BbV/OIa\nH22VRdltMLOV/x+DsGsRNDkhYIU2GUyoGbPMtqmQ1wFDQbZ6aFMrQJW4tPqoNdMj\njWuoLA1Aqaslanx8dhZB6oNqvlJLIABVWPO+a/VXcgN5cTR6BRLqEge56eO/ql+x\nmxiD6Zy/V3B5wBPpqY8Fmg5Y9fH70IWf5PrzNQW1jBq94hNd9KayPeNRQcSqJvpZ\nzwIDAQAB\n-----END PUBLIC KEY-----\n",
+    "policies": [
+      "booking_sync"
+    ],
+    "sim_id": "sim_001",
+    "owner": "홍길동",
+    "carrier": "SKT",
+    "registered_at": "2026-04-01T01:41:30.082723+00:00",
+    "expires_at": "2027-04-01T01:41:30.082723+00:00"
+  },
+  "agent_003": {
+    "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAmNsKuk8HzNngC0zguh6p\nEEDF3qeQG2xw/xemVUlN464TmFWsSNJTBm2CQc7KNTFqbGsen+uW3pfB3n+gjhs7\nb8hCMP1mt3UgC5g8+GT4geLWbx9vb1lnue0aZMI2mcpuCYV0y1BRJ9mlVPkYIZ/Y\nqhiSGAYyUFgJX7/ta0Bb8fHMCoshxCITKJdSz+3C49JeGCVxtxYdAYTYb8YE/3Pw\nDoHG481zVm6DDEOVnkOOop/iLBKk8yO2ylzaS63gBZNLZbNSVTQwB9ibpNkPu6PL\ndfGft1lyua81FfujG5/BnPln78ptGKAfsnWTaZwd1Nxric41YLIv2etNQmBJdKWY\nkwIDAQAB\n-----END PUBLIC KEY-----\n",
+    "policies": [
+      "booking_sync"
+    ],
+    "sim_id": "sim_001",
+    "owner": "홍길동",
+    "carrier": "SKT",
+    "registered_at": "2026-04-01T01:44:23.104286+00:00",
+    "expires_at": "2027-04-01T01:44:23.104286+00:00"
+  }
+}

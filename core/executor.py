@@ -147,6 +147,59 @@ async def execute(tool_name: str, arguments: dict[str, Any]) -> Any:
         return {"error": f"Tool execution failed: {str(e)}"}
 
 
+@tool
+def list_all_available_tools() -> dict:
+    """
+    현재 시스템에 등록된 모든 도구(로컬 및 Phone-MCP 원격 도구)의 이름과 설명을 반환합니다.
+    사용자가 '어떤 기능이 있어?', '도구 목록 보여줘'라고 물어볼 때 이 도구를 사용하여 목록을 확인하세요.
+    """
+    tools_list = []
+    for name, func in _TOOL_REGISTRY.items():
+        # 첫 번째 줄의 docstring을 설명으로 취급
+        doc = func.__doc__
+        desc = doc.strip().split("\n")[0] if doc else "설명 없음"
+        tools_list.append({"name": name, "description": desc})
+    
+    return {"registered_tools": tools_list}
+
+
+from core.telegram_client import telegram_client
+
+@tool
+async def send_telegram_message(message: str, buttons: list[str] = None) -> dict:
+    """
+    사장님의 텔레그램으로 메시지를 전송합니다 (버튼 추가 가능).
+    버튼을 추가하면 사장님이 클릭을 통해 쉽게 명령을 내릴 수 있습니다 (예: ["주소록 확인", "예약 현황", "승인"]).
+    버튼 클릭 시 해당 텍스트가 당신(에이전트)에게 채팅으로 직접 전달됩니다.
+
+    Args:
+        message (str): 텔레그램으로 전송할 본문 메시지 텍스트
+        buttons (list): (선택 사항) 사용자가 클릭할 수 있는 버튼의 라벨 배열. 예: ["버튼1", "버튼2"]
+    """
+    reply_markup = None
+    if buttons:
+        # LLM이 리스트가 아닌 단일 문자열로 통째로 보낼 경우를 대비하여 방어 처리
+        if isinstance(buttons, str):
+            try:
+                import json
+                buttons = json.loads(buttons)
+            except Exception:
+                buttons = [buttons]
+                
+        # 리스트가 확실하게 보장된 상태에서 버튼 생성
+        if isinstance(buttons, list):
+            # Telegram API의 callback_data 64바이트 제한을 피하기 위해 일반 키보드(Reply Keyboard) 사용
+            keyboard = [[{"text": str(btn)}] for btn in buttons]
+            reply_markup = {
+                "keyboard": keyboard,
+                "resize_keyboard": True,
+                "one_time_keyboard": True
+            }
+
+    result = await telegram_client.send_message(message, reply_markup=reply_markup)
+    return {"status": "success", "response": result} if "error" not in result else result
+
+
 def get_registered_tools() -> list[str]:
     """등록된 Tool 이름 목록 반환."""
     return list(_TOOL_REGISTRY.keys())

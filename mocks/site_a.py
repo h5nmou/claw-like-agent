@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import uuid
 import logging
+import asyncio
 from datetime import date, timedelta
 
 import httpx
@@ -427,8 +428,8 @@ async def create_booking(req: BookingRequest):
     _mark_booked(booking.room_id, booking.check_in, booking.check_out)
     logger.info(f"Booking created: {booking.booking_id}")
 
-    # Webhook 전송 (비동기)
-    await send_webhook("booking_confirmed", booking)
+    # Webhook 전송 (비동기, 응답을 블로킹하지 않음)
+    asyncio.create_task(send_webhook("booking_confirmed", booking))
 
     return booking.model_dump()
 
@@ -453,7 +454,7 @@ async def create_booking_form(
     _mark_booked(booking.room_id, booking.check_in, booking.check_out)
     logger.info(f"Booking created (form): {booking.booking_id}")
 
-    await send_webhook("booking_confirmed", booking)
+    asyncio.create_task(send_webhook("booking_confirmed", booking))
 
     return HTMLResponse(
         content='<html><head><meta http-equiv="refresh" content="0;url=/"></head></html>'
@@ -470,6 +471,6 @@ async def cancel_booking(booking_id: str):
     _mark_available(booking.room_id, booking.check_in, booking.check_out)
     logger.info(f"Booking cancelled: {booking_id}")
 
-    await send_webhook("booking_cancelled", booking)
+    asyncio.create_task(send_webhook("booking_cancelled", booking))
 
     return booking.model_dump()

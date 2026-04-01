@@ -66,7 +66,23 @@ REGISTERED_SIMS = {
 
 # ── Agent 등록 DB ────────────────────────────────────
 
+TELCO_AGENTS_PATH = PROJECT_ROOT / "logs" / "telco_agents.json"
 registered_agents: dict[str, dict] = {}
+
+if TELCO_AGENTS_PATH.exists():
+    try:
+        registered_agents = json.loads(TELCO_AGENTS_PATH.read_text(encoding="utf-8"))
+        logger.info(f"Loaded {len(registered_agents)} agents from {TELCO_AGENTS_PATH}")
+    except Exception as e:
+        logger.error(f"Failed to load telco_agents.json: {e}")
+
+def _save_agents() -> None:
+    TELCO_AGENTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    TELCO_AGENTS_PATH.write_text(
+        json.dumps(registered_agents, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
 #  {agent_id: {public_key_pem, policies, sim_id, owner, registered_at, expires_at, status}}
 
 # ── VPAL 세션 & 트래픽 모니터링 ──────────────────────
@@ -169,6 +185,8 @@ async def onboarding_approve(req: OnboardingRequest):
     }
 
     logger.info(f"Agent registered: {agent_id} (owner={sim['owner']}, policies={req.approved_policies})")
+    
+    _save_agents()
 
     # 4. 위임장 생성
     delegation_certificate = {
