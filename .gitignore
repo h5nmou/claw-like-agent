@@ -1,3 +1,8 @@
 .env
 **/__pycache__/
 *.pyc
+.agent_private.pem
+.agent_public.pem
+.agent_cert
+.telco_public.pem
+logs
