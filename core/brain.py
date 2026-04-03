@@ -85,6 +85,13 @@ class Brain:
     def get_message_count(self) -> int:
         return len(self._messages)
 
+    def update_tools(self, new_tools_schema: list[dict]) -> None:
+        """루프 중 새 스킬이 등록되면 Tool 목록을 즉시 갱신.
+        
+        다음 think() 호출 시 LLM이 업데이트된 도구 목록을 받게 됩니다.
+        """
+        self._tools_schema = new_tools_schema
+
     def reset(self, keep_system: bool = True) -> None:
         if keep_system:
             self._messages = [self._messages[0]]

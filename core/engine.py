@@ -402,6 +402,22 @@ async def run_agent_loop(trigger_event: dict) -> dict:
 
                 # 결과를 Brain에 반환
                 brain.add_tool_result(tool_call_id, result)
+
+                # 신규 스킬 등록 시 → Brain의 Tool 목록 즉시 갱신
+                # (에이전트가 다음 루프에서 새 스킬을 직접 호출할 수 있도록)
+                if tool_name == "create_new_skill" and isinstance(result, dict) and result.get("success"):
+                    new_skill_name = result.get("skill_name", "")
+                    updated_schemas = build_function_schemas()
+                    brain.update_tools(updated_schemas)
+                    new_tool_names = [s['function']['name'] for s in updated_schemas]
+                    await broadcaster.emit(
+                        "system",
+                        f"🔄 Tool 목록 갱신 완료 ({len(updated_schemas)}개)\n"
+                        f"✅ '{new_skill_name}' 이 Tool 목록에 추가됨\n"
+                        f"⚡ 다음 루프에서 '{new_skill_name}'을 직접 호출하세요!",
+                        "[Tool 목록 갱신]"
+                    )
+
     else:
         final_summary = "최대 반복 횟수에 도달하여 루프가 종료되었습니다."
         memory.add_event("system", final_summary)

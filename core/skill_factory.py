@@ -623,6 +623,27 @@ class SkillFactory:
         await _log("divider", "SKILL FACTORY — 자율 스킬 생성 시작", "")
         await _log("system", f"📋 요청 분석: {user_request}", "🏭 Skill Factory")
 
+        # ── 이미 등록된 스킬 감지 ──
+        # 요청 키워드로 기존 스킬 검색: email/smtp → send_email_via_smtp 등
+        from core.executor import _TOOL_REGISTRY
+        email_keywords = {"email", "mail", "smtp", "이메일", "메일"}
+        user_req_lower = user_request.lower()
+        if any(kw in user_req_lower for kw in email_keywords):
+            if "send_email_via_smtp" in _TOOL_REGISTRY:
+                await _log("system",
+                    "✅ 이미 등록된 이메일 스킬 감지 — 재생성 없이 기존 스킬 사용",
+                    "[스킬 재사용]")
+                return {
+                    "success": True,
+                    "skill_name": "send_email_via_smtp",
+                    "description": "Gmail SMTP 이메일 전송 스킬 (기존 등록)",
+                    "message": (
+                        "✅ **이미 등록된 스킬 'send_email_via_smtp' 사용!**\n\n"
+                        "⚡ **지금 즉시 이 스킬을 tool_call로 호출하여 이메일을 전송하세요!**\n"
+                        "말로만 '사용하겠습니다'라고 하지 말고 실제 tool_call을 수행해야 합니다."
+                    ),
+                }
+
         # ── Phase 1: 탐색 및 전략 수립 ──
         await _log("divider", "PHASE 1 — 탐색 및 전략 수립", "")
         strategy = await self.discovery.discover_strategy(user_request)
@@ -769,7 +790,9 @@ class SkillFactory:
                     f"- 설명: {description}\n"
                     f"- 테스트 결과: {exec_result['output'][:300]}\n"
                     f"- 파일: `generated_skills/{skill_name}.py`\n\n"
-                    f"이제 바로 사용하실 수 있습니다."
+                    f"⚡ **이 스킬은 지금 즉시 호출 가능합니다!**\n"
+                    f"반드시 다음 단계로 '{skill_name}' 도구를 tool_call로 즉시 호출하여 요청을 완료하세요.\n"
+                    f"말로만 '사용하겠습니다'라고 하지 말고 실제 tool_call을 수행해야 합니다."
                 ),
             }
         else:
