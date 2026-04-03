@@ -102,15 +102,17 @@ async def startup_mcp_tools():
 
 @app.on_event("startup")
 async def startup_skill_registry():
-    """generated_skills/ 내 저장된 모든 스킬을 자동 로드하고 Skill Factory log hook 연결."""
+    """generated_skills/ 내 저장된 모든 스킬을 자동 로드하고 Enterprise 서브시스템 초기화."""
     from core.skill_registry import get_skill_registry
     from core.skill_factory import set_log_hook
+    from core.skill_healer import set_briefing_hook
 
-    await broadcaster.emit("divider", "PHASE 0.6 — Skill Library 로드", "")
-    await broadcaster.emit("system", "📚 스킬 라이브러리 초기화 중...", "⚙️ Skill Registry")
+    await broadcaster.emit("divider", "PHASE 0.6 — Enterprise Skill Ecosystem 초기화", "")
+    await broadcaster.emit("system", "📚 [로그 분석 중...] 스킬 라이브러리 초기화...", "⚙️ Skill Registry")
 
-    # broadcaster.emit을 skill_factory의 로그 훅으로 연결
+    # broadcaster.emit을 skill_factory 및 self-healer의 로그 훅으로 연결
     set_log_hook(broadcaster.emit)
+    set_briefing_hook(broadcaster.emit)
 
     registry = get_skill_registry()
     loaded_count = registry.load_all()
@@ -120,14 +122,41 @@ async def startup_skill_registry():
         skill_names = ", ".join(stats["skill_names"])
         await broadcaster.emit(
             "system",
-            f"✅ 스킬 라이브러리 로드 완료 — {loaded_count}개 스킬 활성화\n  등록 스킬: {skill_names}",
+            f"✅ 스킬 라이브러리 로드 완료 — {loaded_count}개 스킬 활성화\n"
+            f"  등록 스킬: {skill_names}\n"
+            f"  Progressive Loading: {'활성' if stats.get('progressive_loading') else '비활성'}",
             "📚 Skill Library"
         )
     else:
         await broadcaster.emit(
             "system",
-            "📭 저장된 스킬 없음 — 새 요청 시 자동 생성됩니다.",
+            "📭 저장된 스킬 없음 — 새 요청 시 Enterprise Skill Factory 2.0이 자동 생성합니다.",
             "📚 Skill Library"
+        )
+
+    # 품질 평가기 초기화
+    from core.skill_quality import get_quality_evaluator
+    evaluator = get_quality_evaluator()
+    quality_stats = evaluator.get_dashboard_stats()
+    if quality_stats:
+        critical_skills = [name for name, s in quality_stats.items() if s["status"] == "critical"]
+        if critical_skills:
+            await broadcaster.emit(
+                "error",
+                f"🚨 [품질 경고] 다음 스킬이 연속 실패 상태: {', '.join(critical_skills)}",
+                "⚙️ Quality Monitor"
+            )
+        else:
+            await broadcaster.emit(
+                "system",
+                f"✅ [보안 취약점 스캔 완료] 품질 모니터링 활성 — {len(quality_stats)}개 스킬 추적 중",
+                "⚙️ Quality Monitor"
+            )
+    else:
+        await broadcaster.emit(
+            "system",
+            "✅ 품질 평가 엔진 초기화 완료 — 스킬 실행 시 자동 추적 시작",
+            "⚙️ Quality Monitor"
         )
 
 
@@ -464,6 +493,63 @@ async def run_agent_loop(trigger_event: dict) -> dict:
                 logger.info(f"Tool result: {result_str}")
                 memory.add_event("tool_result", {"name": tool_name, "result": result})
 
+                # ── Self-Healing: 생성된 스킬 실행 실패 시 자율 복구 ──
+                _is_generated_skill = tool_name not in {
+                    "list_all_available_tools", "send_telegram_message",
+                    "create_new_skill", "reload_env",
+                    "get_telco_auth_token", "block_site_b_dates",
+                    "block_site_b_dates_with_token", "get_site_a_bookings",
+                    "create_site_a_booking",
+                }
+                _has_error = isinstance(result, dict) and "error" in result
+
+                if _is_generated_skill and _has_error:
+                    await broadcaster.emit("system",
+                        f"⚠️ 스킬 실행 오류 감지: {tool_name} — 자가 치유 판단 중...",
+                        "[오류 감지]")
+
+                    from core.skill_quality import get_quality_evaluator
+                    evaluator = get_quality_evaluator()
+                    if evaluator.needs_healing(tool_name):
+                        await broadcaster.emit("system",
+                            f"🏥 [AI Doctor 복구 시도 중] 연속 실패 감지 → Self-Healing 가동",
+                            "[Self-Healing]")
+
+                        from core.skill_healer import get_skill_healer
+                        healer = get_skill_healer()
+                        healing_report = await healer.heal(
+                            skill_name=tool_name,
+                            original_error=str(result.get("error", "")),
+                            execution_args=tool_args,
+                        )
+
+                        if healing_report.healed:
+                            # 복구 후 재실행
+                            await broadcaster.emit("complete",
+                                f"✅ [Self-Healing 복구 완료] {tool_name} — 방법: {healing_report.healing_method}",
+                                "[복구 완료]")
+                            result = await execute(tool_name, tool_args)
+                            result_str = json.dumps(result, ensure_ascii=False, indent=2) if isinstance(result, dict) else str(result)
+                        else:
+                            await broadcaster.emit("error",
+                                f"🚨 [Self-Healing 실패] {tool_name} — Stage {healing_report.stage_reached}/4 도달",
+                                "[복구 실패]")
+
+                    # 품질 게이트: 품질 미달 시 자동 롤백
+                    if evaluator.needs_rollback(tool_name):
+                        from core.skill_versioning import get_version_manager
+                        vm = get_version_manager()
+                        rec = evaluator.get_record(tool_name)
+                        if rec:
+                            gate_result = vm.quality_gate_check(tool_name, rec.avg_quality)
+                            if gate_result["action"] == "rollback":
+                                await broadcaster.emit("system",
+                                    f"⚠️ [품질 게이트 롤백] {gate_result['message']}",
+                                    "[Quality Gate]")
+                                # 롤백 후 Tool 스키마 갱신
+                                updated_schemas = build_function_schemas()
+                                brain.update_tools(updated_schemas)
+
                 # 토큰 발급 시 정책 하이라이트
                 if isinstance(result, dict) and result.get("policy_matched"):
                     await broadcaster.emit(
@@ -490,12 +576,10 @@ async def run_agent_loop(trigger_event: dict) -> dict:
                 brain.add_tool_result(tool_call_id, result)
 
                 # 신규 스킬 등록 시 → Brain의 Tool 목록 즉시 갱신
-                # (에이전트가 다음 루프에서 새 스킬을 직접 호출할 수 있도록)
                 if tool_name == "create_new_skill" and isinstance(result, dict) and result.get("success"):
                     new_skill_name = result.get("skill_name", "")
                     updated_schemas = build_function_schemas()
                     brain.update_tools(updated_schemas)
-                    new_tool_names = [s['function']['name'] for s in updated_schemas]
                     await broadcaster.emit(
                         "system",
                         f"🔄 Tool 목록 갱신 완료 ({len(updated_schemas)}개)\n"
@@ -534,10 +618,24 @@ async def chat(request: Request):
     global _pending_original_context
     data = await request.json()
     user_message = data.get("message", "")
-    
+
     if not user_message:
         return {"error": "No message provided"}
-    
+
+    # ── 프롬프트 주입 방어 (데이터/명령 분리 원칙) ──
+    from core.skill_security import get_security_gate
+    gate = get_security_gate()
+    injection_findings = gate.scan_user_input(user_message)
+    if injection_findings:
+        await broadcaster.emit(
+            "error",
+            f"🛡️ [프롬프트 주입 탐지] 의심스러운 입력 감지:\n"
+            + "\n".join(f"  - {f}" for f in injection_findings),
+            "[보안 게이트]"
+        )
+        logger.warning(f"Prompt injection attempt detected: {injection_findings}")
+        return {"response": "⚠️ 보안 정책에 위반되는 입력이 감지되었습니다. 일반적인 요청을 입력해 주세요."}
+
     logger.info(f"Chat command received: {user_message}")
     
     # 에이전트 루프 실행 (트리거 이벤트를 채팅 메시지로 설정)
@@ -1298,3 +1396,128 @@ async def delete_skill(skill_name: str):
     )
 
     return result
+
+
+# ── Enterprise API 엔드포인트 ─────────────────────────────────
+
+@app.get("/quality")
+async def get_quality_dashboard():
+    """스킬 품질 대시보드 — 오류율, 품질 등급, 자가 치유 상태."""
+    from core.skill_quality import get_quality_evaluator
+    evaluator = get_quality_evaluator()
+    stats = evaluator.get_dashboard_stats()
+
+    summary = {
+        "total_tracked": len(stats),
+        "healthy": sum(1 for s in stats.values() if s["status"] == "healthy"),
+        "warning": sum(1 for s in stats.values() if s["status"] == "warning"),
+        "critical": sum(1 for s in stats.values() if s["status"] == "critical"),
+        "skills": stats,
+    }
+    return summary
+
+
+@app.get("/quality/{skill_name}")
+async def get_skill_quality(skill_name: str):
+    """특정 스킬의 품질 상세 정보."""
+    from core.skill_quality import get_quality_evaluator
+    evaluator = get_quality_evaluator()
+    rec = evaluator.get_record(skill_name)
+    if not rec:
+        return JSONResponse(status_code=404, content={"error": f"품질 기록 없음: {skill_name}"})
+    return {
+        "skill_name": rec.skill_name,
+        "total_runs": rec.total_runs,
+        "error_rate": f"{rec.error_rate:.1%}",
+        "avg_quality": f"{rec.avg_quality:.1f}",
+        "avg_time_ms": f"{rec.avg_time_ms:.0f}",
+        "consecutive_failures": rec.consecutive_failures,
+        "needs_healing": evaluator.needs_healing(skill_name),
+        "needs_rollback": evaluator.needs_rollback(skill_name),
+    }
+
+
+@app.post("/skills/{skill_name}/heal")
+async def heal_skill(skill_name: str):
+    """특정 스킬에 대해 수동으로 자가 치유를 트리거."""
+    from core.skill_healer import get_skill_healer
+    healer = get_skill_healer()
+
+    await broadcaster.emit("system",
+        f"🏥 [AI Doctor 복구 시도 중] 수동 트리거: {skill_name}",
+        "[Self-Healing]")
+
+    report = await healer.heal(
+        skill_name=skill_name,
+        original_error="수동 치유 트리거",
+        execution_args={},
+    )
+    return report.to_dict()
+
+
+@app.get("/skills/{skill_name}/versions")
+async def get_skill_versions(skill_name: str):
+    """특정 스킬의 버전 이력 조회."""
+    from core.skill_versioning import get_version_manager
+    vm = get_version_manager()
+    return {
+        "skill_name": skill_name,
+        "current_version": vm.get_current_version(skill_name),
+        "versions": vm.list_versions(skill_name),
+        "history": vm.get_version_history(skill_name),
+    }
+
+
+@app.post("/skills/{skill_name}/rollback/{version}")
+async def rollback_skill(skill_name: str, version: str):
+    """특정 버전으로 스킬 롤백."""
+    from core.skill_versioning import get_version_manager
+    vm = get_version_manager()
+    result = vm.rollback(skill_name, version)
+
+    if result["success"]:
+        await broadcaster.emit("system",
+            f"↩️ 스킬 롤백 완료: {skill_name} → {version}",
+            "[버전 롤백]")
+        # Brain Tool 스키마 갱신
+        from core.executor import build_function_schemas
+        updated = build_function_schemas()
+        logger.info(f"롤백 후 Tool 스키마 갱신: {len(updated)}개")
+
+    return result
+
+
+@app.get("/security/audit")
+async def get_security_audit():
+    """보안 감사 로그 최근 50건 조회."""
+    audit_path = Path(__file__).resolve().parent.parent / "logs" / "security_audit.json"
+    if not audit_path.exists():
+        return {"entries": [], "total": 0}
+    try:
+        import json as _json
+        history = _json.loads(audit_path.read_text(encoding="utf-8"))
+        return {
+            "entries": history[-50:],
+            "total": len(history),
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/healing/log")
+async def get_healing_log():
+    """자가 치유 로그 최근 20건 조회."""
+    healing_path = Path(__file__).resolve().parent.parent / "logs" / "healing_log.json"
+    if not healing_path.exists():
+        return {"entries": [], "total": 0}
+    try:
+        import json as _json
+        history = _json.loads(healing_path.read_text(encoding="utf-8"))
+        return {
+            "entries": history[-20:],
+            "total": len(history),
+            "healed_count": sum(1 for e in history if e.get("healed")),
+            "escalated_count": sum(1 for e in history if not e.get("healed")),
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})

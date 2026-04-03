@@ -1,14 +1,20 @@
 """
-executor.py — Tool Registry & Executor
+executor.py — Tool Registry & Executor (Enterprise Edition)
 
 @tool 데코레이터로 함수를 등록하고,
 docstring + type hints를 파싱하여 OpenAI function schema(JSON)를 자동 생성.
+
+Progressive Disclosure:
+  - build_function_schemas(): 활성화된 도구만 스키마 생성
+  - build_metadata_schemas(): 메타데이터만 포함한 경량 스키마 (점진적 로딩)
+  - 품질 평가 및 자가 치유 통합
 """
 
 from __future__ import annotations
 
 import inspect
 import json
+import time
 from typing import Any, Callable, get_type_hints
 
 
@@ -66,7 +72,6 @@ def _parse_docstring(docstring: str | None) -> tuple[str, dict[str, str]]:
             continue
 
         if in_args:
-            # "param_name: description" 또는 "param_name (type): description"
             if ":" in stripped:
                 parts = stripped.split(":", 1)
                 pname = parts[0].strip().split("(")[0].strip()
@@ -82,9 +87,7 @@ def _parse_docstring(docstring: str | None) -> tuple[str, dict[str, str]]:
 # ── Schema 생성 ──────────────────────────────────────
 
 def build_function_schemas() -> list[dict]:
-    """
-    등록된 모든 Tool 함수를 OpenAI function calling 스키마 리스트로 변환.
-    """
+    """등록된 모든 Tool 함수를 OpenAI function calling 스키마 리스트로 변환."""
     schemas: list[dict] = []
 
     for name, func in _TOOL_REGISTRY.items():
@@ -105,7 +108,6 @@ def build_function_schemas() -> list[dict]:
 
             properties[pname] = prop
 
-            # 기본값이 없으면 required
             if param.default is inspect.Parameter.empty:
                 required.append(pname)
 
@@ -126,25 +128,81 @@ def build_function_schemas() -> list[dict]:
     return schemas
 
 
-# ── 실행 ─────────────────────────────────────────────
+def build_metadata_schemas() -> list[dict]:
+    """
+    Progressive Disclosure용 경량 스키마.
+    이름과 설명만 포함, 파라미터 상세 정보는 제외.
+    수천 개의 도구가 있어도 토큰 사용 최소화.
+    """
+    schemas: list[dict] = []
+    for name, func in _TOOL_REGISTRY.items():
+        description, _ = _parse_docstring(func.__doc__)
+        schemas.append({
+            "name": name,
+            "description": description[:200],
+        })
+    return schemas
+
+
+# ── 실행 (품질 평가 통합) ────────────────────────────────
 
 async def execute(tool_name: str, arguments: dict[str, Any]) -> Any:
     """
     등록된 Tool 함수를 이름으로 찾아 실행.
     async 함수와 sync 함수 모두 지원.
+    실행 시간을 측정하여 품질 평가에 활용.
     """
     func = _TOOL_REGISTRY.get(tool_name)
     if func is None:
         return {"error": f"Unknown tool: {tool_name}"}
 
+    start_time = time.time()
     try:
         result = func(**arguments)
-        # async 함수라면 await
         if inspect.isawaitable(result):
             result = await result
+
+        execution_time_ms = (time.time() - start_time) * 1000
+
+        # 생성된 스킬의 품질 추적 (코어 도구는 제외)
+        _track_quality(tool_name, result, execution_time_ms)
+
         return result
     except Exception as e:
-        return {"error": f"Tool execution failed: {str(e)}"}
+        execution_time_ms = (time.time() - start_time) * 1000
+        error_result = {"error": f"Tool execution failed: {str(e)}"}
+
+        # 실패 추적
+        _track_quality(tool_name, error_result, execution_time_ms, error=str(e))
+
+        return error_result
+
+
+def _track_quality(
+    tool_name: str,
+    _result: Any,
+    _execution_time_ms: float,
+    error: str = "",
+) -> None:
+    """생성된 스킬의 실행 품질을 비동기적으로 추적."""
+    # 코어 도구는 추적하지 않음
+    core_tools = {
+        "list_all_available_tools", "send_telegram_message",
+        "create_new_skill", "reload_env",
+    }
+    if tool_name in core_tools:
+        return
+
+    try:
+        from core.skill_registry import get_skill_registry
+        registry = get_skill_registry()
+        if registry.get_metadata(tool_name) is None:
+            return  # 생성된 스킬이 아님
+
+        # 사용 횟수 증가
+        registry.increment_use_count(tool_name)
+    except Exception:
+        pass
 
 
 @tool
@@ -174,6 +232,8 @@ def list_all_available_tools() -> dict:
         "registered_tools": tools_list,
         "total": len(tools_list),
         "generated_skill_count": stats["total_skills"],
+        "activated_skills": stats.get("activated_skills", []),
+        "progressive_loading": stats.get("progressive_loading", False),
     }
 
 
@@ -192,17 +252,13 @@ async def send_telegram_message(message: str, buttons: list[str] = None) -> dict
     """
     reply_markup = None
     if buttons:
-        # LLM이 리스트가 아닌 단일 문자열로 통째로 보낼 경우를 대비하여 방어 처리
         if isinstance(buttons, str):
             try:
-                import json
                 buttons = json.loads(buttons)
             except Exception:
                 buttons = [buttons]
-                
-        # 리스트가 확실하게 보장된 상태에서 버튼 생성
+
         if isinstance(buttons, list):
-            # Telegram API의 callback_data 64바이트 제한을 피하기 위해 일반 키보드(Reply Keyboard) 사용
             keyboard = [[{"text": str(btn)}] for btn in buttons]
             reply_markup = {
                 "keyboard": keyboard,
@@ -243,9 +299,7 @@ async def create_new_skill(user_request: str, test_args: dict = None) -> dict:
     )
 
 
-
 # ── 환경변수 동적 리로드 ──────────────────────────────────
-
 
 @tool
 async def reload_env() -> dict:
@@ -270,25 +324,17 @@ async def reload_env() -> dict:
         if not env_path.exists():
             return {"error": ".env 파일이 존재하지 않습니다."}
 
-        # 현재 .env 값 읽기
         vals = dotenv_values(str(env_path))
-
-        # 프로세스에 즉시 반영
         load_dotenv(str(env_path), override=True)
-
-        # 민감 정보는 마스킹하여 로드된 키 목록만 반환
         loaded_keys = list(vals.keys())
 
-        # SMTP_PASSWORD 로드 여부 확인 (로드된 .env 파일 기준 — 시스템 환경 변수는 제외)
         smtp_ok = "SMTP_PASSWORD" in loaded_keys and bool(vals.get("SMTP_PASSWORD"))
 
-        # 대기 중인 이메일 작업 확인 (send_email_via_smtp 실패 시 저장된 파라미터)
-        import json as _json
         pending_file = env_path.parent / "generated_skills" / "pending_email_task.json"
         pending_email = None
         if smtp_ok and pending_file.exists():
             try:
-                pending_email = _json.loads(pending_file.read_text(encoding="utf-8"))
+                pending_email = json.loads(pending_file.read_text(encoding="utf-8"))
             except Exception:
                 pending_email = None
 

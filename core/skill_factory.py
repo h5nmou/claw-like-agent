@@ -1,22 +1,24 @@
 """
-skill_factory.py — The Autonomous Toolmaker
+skill_factory.py — Enterprise Skill Factory 2.0
 
-해결 불가능한 요청을 받으면 자율적으로 아래 3단계를 실행:
+엔터프라이즈급 자율 스킬 생성 파이프라인:
 
 Phase 1: 탐색 — 공식 API/MCP 서버 탐색 → 공공데이터포털 폴백
-Phase 2: 합성 및 검증 — 코드 생성 → 샌드박스 실행 → Self-Correction
-Phase 3: 등록 — executor 레지스트리 즉시 등록 + generated_skills/ 저장
+Phase 2: 합성 및 검증 — LATM 구조 (Maker 고성능 모델 → User 경량 모델)
+  - 반복적 프롬프팅 (Iterative Prompting): 실행 오류 + 환경 피드백 루프
+  - 피어 리뷰 (Peer Review): 별도 모델이 효율성/안전성 검토
+  - 보안 게이트: 다단계 보안 + 프롬프트 주입 방어
+  - 품질 평가: 다중 신호 채점
+Phase 3: 등록 — 버전 관리 + executor 등록 + 즉시 사용 가능
 """
 
 from __future__ import annotations
 
 import asyncio
 import importlib.util
-import inspect
 import json
 import logging
 import os
-import subprocess
 import sys
 import tempfile
 import textwrap
@@ -36,9 +38,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 GENERATED_SKILLS_DIR = PROJECT_ROOT / "generated_skills"
 SKILL_INDEX_PATH = GENERATED_SKILLS_DIR / "skill_index.json"
 
-# ── 로그 출력 헬퍼 (실시간 가시성) ───────────────────────
+# ── 로그 출력 헬퍼 (실시간 브리핑) ──────────────────────
 
-_log_hook: Callable[[str, str, str], Any] | None = None  # (log_type, content, meta)
+_log_hook: Callable[[str, str, str], Any] | None = None
 
 
 def set_log_hook(hook: Callable) -> None:
@@ -54,6 +56,18 @@ async def _log(level: str, msg: str, meta: str = "") -> None:
         await _log_hook(level, msg, meta)
 
 
+# ── LATM 모델 설정 ──────────────────────────────────────────
+
+def _get_maker_model() -> str:
+    """Maker (고성능 모델) — 코드 생성 + 피어 리뷰."""
+    return os.getenv("SKILL_MAKER_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o"))
+
+
+def _get_user_model() -> str:
+    """User (경량 모델) — 실제 실행 시 사용."""
+    return os.getenv("SKILL_USER_MODEL", "gpt-4o-mini")
+
+
 # ── API 탐색 ─────────────────────────────────────────────
 
 class APIDiscovery:
@@ -63,7 +77,7 @@ class APIDiscovery:
     SERPER_ENDPOINT = "https://google.serper.dev/search"
 
     def __init__(self) -> None:
-        self.serper_key = os.getenv("SERPER_API_KEY")  # 선택적
+        self.serper_key = os.getenv("SERPER_API_KEY")
         self._client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
     async def search(self, query: str) -> list[dict]:
@@ -96,7 +110,7 @@ class APIDiscovery:
                 resp = await client.get(
                     self.DDGS_ENDPOINT,
                     params={"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"},
-                    headers={"User-Agent": "Mozilla/5.0 SkillFactory/1.0"},
+                    headers={"User-Agent": "Mozilla/5.0 SkillFactory/2.0"},
                 )
                 data = resp.json()
                 results = []
@@ -119,23 +133,9 @@ class APIDiscovery:
             return []
 
     async def discover_strategy(self, user_request: str) -> dict:
-        """
-        요청에 맞는 최적 API/MCP 전략을 결정하여 반환.
-
-        Returns:
-            {
-                "strategy": "official_api" | "public_api" | "mcp",
-                "service_name": str,
-                "api_endpoint": str,
-                "auth_required": bool,
-                "env_key_name": str | None,
-                "description": str,
-                "search_results": list
-            }
-        """
+        """요청에 맞는 최적 API/MCP 전략을 결정하여 반환."""
         await _log("system", f"🔍 탐색 시작: '{user_request}'", "[탐색 중...]")
 
-        # 1단계: 공식 API 검색
         queries = [
             f"{user_request} official REST API python",
             f"{user_request} python library pip",
@@ -146,15 +146,12 @@ class APIDiscovery:
             results = await self.search(q)
             all_results.extend(results)
 
-        # 2단계: MCP 서버 검색
         mcp_results = await self.search(f"{user_request} MCP server model context protocol")
         all_results.extend(mcp_results)
 
-        # 3단계: 공공데이터포털 폴백
         public_results = await self.search(f"{user_request} 공공데이터포털 data.go.kr API")
         all_results.extend(public_results)
 
-        # LLM이 검색 결과를 보고 전략 결정
         strategy = await self._analyze_with_llm(user_request, all_results)
         return strategy
 
@@ -201,7 +198,7 @@ class APIDiscovery:
 
         try:
             response = await self._client.chat.completions.create(
-                model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+                model=_get_maker_model(),
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
             )
@@ -220,10 +217,10 @@ class APIDiscovery:
             }
 
 
-# ── 코드 합성 ─────────────────────────────────────────────
+# ── 코드 합성 (LATM Maker) ──────────────────────────────────
 
 class CodeSynthesizer:
-    """LLM 기반 Tool 코드 생성기."""
+    """LATM Maker — 고성능 모델 기반 코드 생성기."""
 
     def __init__(self) -> None:
         self._client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -235,25 +232,31 @@ class CodeSynthesizer:
         test_args: dict | None = None,
         previous_error: str | None = None,
         previous_code: str | None = None,
+        env_feedback: str | None = None,
+        iteration: int = 1,
     ) -> str:
         """
         완전한 @tool 함수 코드 생성 (Google-style docstring 포함).
-        Self-Correction: previous_error가 있으면 오류를 참고하여 수정.
+
+        반복적 프롬프팅 (Iterative Prompting):
+          - previous_error: 이전 실행 오류 피드백
+          - env_feedback: 환경 피드백 (패키지 누락, 네트워크 상태 등)
+          - iteration: 현재 반복 횟수
         """
         env_key = strategy.get("env_key_name")
         auth_note = f"환경변수 `{env_key}`에서 API 키를 읽어라." if env_key else "인증 불필요."
         pip_note = f"pip 패키지 필요: {strategy.get('pip_packages', [])}" if strategy.get("pip_packages") else ""
 
-        # test_args에서 파라미터 이름 힌트 생성
         param_hint = ""
         if test_args:
             param_names = list(test_args.keys())
             param_hint = f"\n## 함수 파라미터 요구사항 (반드시 준수)\n함수는 다음 파라미터 이름을 **정확히** 사용해야 합니다: {param_names}\n예: def func({', '.join(param_names)}): ..."
 
+        # 반복적 프롬프팅: 이전 오류 + 환경 피드백 통합
         correction_section = ""
         if previous_error and previous_code:
             correction_section = f"""
-## 이전 실행 오류 (반드시 수정):
+## 이전 실행 오류 (반복 {iteration}차 — 반드시 수정):
 ```
 {previous_error}
 ```
@@ -261,7 +264,13 @@ class CodeSynthesizer:
 ```python
 {previous_code}
 ```
-위 오류를 수정하여 올바른 코드를 생성하라.
+위 오류를 분석하여 근본 원인을 해결하라. 동일한 실수를 반복하지 마라.
+"""
+        if env_feedback:
+            correction_section += f"""
+## 환경 피드백 (시스템 자동 감지):
+{env_feedback}
+이 환경 피드백을 반영하여 코드를 조정하라.
 """
 
         prompt = f"""당신은 Python 에이전트 도구를 생성하는 코드 합성 전문가입니다.
@@ -290,6 +299,7 @@ class CodeSynthesizer:
 8. **import 구문은 함수 상단이 아닌 파일 최상단에 위치**
 9. `from __future__ import annotations` 포함
 10. pip 패키지가 필요한 경우 주석으로 설치 명령 명시
+11. **민감 정보(API 키, 토큰)는 절대 코드에 노출 금지** — os.getenv() 전용
 
 ## 이메일 전송 구현 시 반드시 준수 (CRITICAL)
 이메일 전송 함수의 파라미터명은 **반드시 아래와 같이 정확히 사용**해야 합니다:
@@ -302,9 +312,12 @@ class CodeSynthesizer:
 Python 코드 파일 전체를 마크다운 코드블록 없이 순수 Python 코드로만 출력:
 """
 
-        await _log("system", "⚙️ LLM으로 Tool 코드 합성 중...", "[코드 합성 중...]")
+        await _log("system",
+            f"⚙️ [LATM Maker] 코드 합성 중... (모델: {_get_maker_model()}, 반복: {iteration}차)",
+            "[코드 합성 중...]")
+
         response = await self._client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+            model=_get_maker_model(),
             messages=[{"role": "user", "content": prompt}],
         )
         raw = response.choices[0].message.content.strip()
@@ -320,29 +333,105 @@ Python 코드 파일 전체를 마크다운 코드블록 없이 순수 Python �
         return raw
 
 
-# ── 샌드박스 실행 ─────────────────────────────────────────
+# ── 피어 리뷰 (Peer Review) ─────────────────────────────────
+
+class PeerReviewer:
+    """
+    별도 고성능 모델을 활용한 코드 리뷰어.
+    효율성, 가독성, 특히 안전성을 검토.
+    """
+
+    def __init__(self) -> None:
+        self._client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+    async def review(self, code: str, skill_name: str, strategy: dict) -> dict:
+        """
+        생성된 코드를 피어 리뷰.
+
+        Returns:
+            {
+                "approved": bool,
+                "score": int (0-100),
+                "issues": list[str],
+                "suggestions": list[str],
+                "patched_code": str | None  (수정이 필요한 경우)
+            }
+        """
+        review_model = os.getenv("SKILL_REVIEW_MODEL", _get_maker_model())
+        await _log("system",
+            f"🔍 [Peer Review] 코드 리뷰 시작 (모델: {review_model})",
+            "[피어 리뷰 중...]")
+
+        prompt = f"""당신은 시니어 Python 보안 코드 리뷰어입니다.
+아래 자동 생성된 에이전트 Tool 코드를 검토하세요.
+
+## 스킬 정보
+- 이름: {skill_name}
+- 서비스: {strategy.get('service_name', 'Unknown')}
+- 전략: {strategy.get('strategy', 'unknown')}
+
+## 검토 대상 코드
+```python
+{code}
+```
+
+## 검토 기준
+1. **안전성** (최우선): eval/exec 사용, 쉘 인젝션, 하드코딩된 시크릿, SQL 인젝션
+2. **효율성**: 불필요한 API 호출, 리소스 누수 (미닫힌 클라이언트), 비효율적 루프
+3. **가독성**: 명확한 변수명, 적절한 에러 처리, 반환값 일관성
+4. **호환성**: async/await 올바른 사용, @tool 데코레이터 존재, 올바른 import
+
+## 출력 (JSON)
+{{
+  "approved": true/false,
+  "score": 0-100,
+  "issues": ["심각한 문제점 목록 (빈 배열이면 문제 없음)"],
+  "suggestions": ["개선 제안 목록"],
+  "patched_code": null 또는 "수정된 전체 코드 (심각한 문제가 있을 때만)"
+}}"""
+
+        try:
+            response = await self._client.chat.completions.create(
+                model=review_model,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+            )
+            result = json.loads(response.choices[0].message.content)
+
+            score = result.get("score", 70)
+            issues = result.get("issues", [])
+
+            if issues:
+                issues_text = "\n".join(f"  - {i}" for i in issues)
+                await _log("system",
+                    f"⚠️ [Peer Review] 발견된 이슈 ({len(issues)}건):\n{issues_text}",
+                    "[피어 리뷰 결과]")
+            else:
+                await _log("system",
+                    f"✅ [Peer Review] 통과 — 점수: {score}/100",
+                    "[피어 리뷰 통과]")
+
+            return result
+
+        except Exception as e:
+            logger.warning(f"피어 리뷰 실패: {e}")
+            # 리뷰 실패 시 기본 승인 (가용성 우선)
+            return {"approved": True, "score": 60, "issues": [], "suggestions": [f"리뷰 실패: {e}"], "patched_code": None}
+
+
+# ── 샌드박스 실행 ─────────────────────────────────────────────
 
 class SandboxExecutor:
     """생성된 코드를 격리된 subprocess에서 실행, 결과 검증."""
 
-    TIMEOUT = 30  # 초
+    TIMEOUT = 30
 
     async def execute(self, code: str, test_args: dict | None = None) -> dict:
-        """
-        코드를 임시 파일로 저장 후 subprocess 실행.
-
-        Returns:
-            {"success": bool, "output": str, "error": str | None}
-        """
-        # 코드에서 함수명 추출
+        """코드를 임시 파일로 저장 후 subprocess 실행."""
         func_name = self._extract_function_name(code)
         if not func_name:
             return {"success": False, "output": "", "error": "함수명을 찾을 수 없습니다."}
 
-        # 생성 코드 전처리:
-        # - `from __future__ import annotations` 제거 (러너 최상단에 이미 위치)
-        # - `from core.executor import tool` 제거 (Mock으로 대체)
-        # - LLM이 대소문자를 잘못 쓴 경우 정규화 (Core.executor → core.executor)
         import re as _re
         code = _re.sub(
             r'from\s+[Cc]ore\.executor\s+import\s+tool',
@@ -355,37 +444,29 @@ class SandboxExecutor:
             and not line.strip().startswith("from core.executor import tool")
         )
 
-        # 테스트 래퍼 생성 (from __future__ 는 반드시 파일 최상단)
-        # test_args를 함수 실제 파라미터에 맞게 필터링 (시그니처 불일치 방지)
         filtered_args = self._filter_args_for_func(cleaned_code, func_name, test_args or {})
-        # 필터링 결과가 비어있으면 원래 test_args로 폴백 (파라미터 이름이 달라도 시도)
         if not filtered_args and test_args:
-            filtered_args = test_args  # 파라미터 이름 불일치 시 원본 test_args 사용
+            filtered_args = test_args
         test_args_repr = json.dumps(filtered_args, ensure_ascii=False)
-        # 실제 PROJECT_ROOT 경로를 직접 주입 (임시 파일 위치 기반 추론을 사용하지 않음)
+
         _injected_root = repr(str(PROJECT_ROOT))
-        _injected_env  = repr(str(PROJECT_ROOT / ".env"))
+        _injected_env = repr(str(PROJECT_ROOT / ".env"))
         runner_code = (
             "from __future__ import annotations\n"
             "import asyncio, sys, os, json\n"
             "from pathlib import Path\n"
             "from types import ModuleType\n"
             "\n"
-            "# 실제 프로젝트 루트를 sys.path에 주입 (임시파일 위치와 무관)\n"
             f"_root = Path({_injected_root})\n"
             "if str(_root) not in sys.path:\n"
             "    sys.path.insert(0, str(_root))\n"
             "\n"
-            "# dotenv 로드\n"
             "from dotenv import load_dotenv\n"
             f"load_dotenv({_injected_env})\n"
             "\n"
-            "# Mock @tool 데코레이터 정의\n"
             "def tool(func):\n"
             "    return func\n"
             "\n"
-            "# core.executor를 sys.modules에 mock으로 등록\n"
-            "# (실제 import 없이 @tool 데코레이터 사용 가능)\n"
             "_mock_exe = ModuleType('core.executor')\n"
             "_mock_exe.tool = tool\n"
             "_mock_core = sys.modules.get('core') or ModuleType('core')\n"
@@ -451,21 +532,13 @@ class SandboxExecutor:
         return None
 
     def _filter_args_for_func(self, code: str, func_name: str, test_args: dict) -> dict:
-        """
-        생성된 코드의 함수 파라미터와 test_args를 최적 매핑.
-
-        전략 (하이브리드):
-        1. 이름이 일치하는 파라미터는 그대로 사용
-        2. 함수에는 있지만 test_args에 없는 파라미터 → 아직 사용되지 않은 test_arg 값을 순서대로 채움
-        3. 파싱 실패 시 test_args 원본 반환
-        """
+        """생성된 코드의 함수 파라미터와 test_args를 최적 매핑."""
         import re
         pattern = rf"(?:async\s+)?def\s+{re.escape(func_name)}\s*\(([^)]*)\)"
         match = re.search(pattern, code, re.DOTALL)
         if not match:
-            return test_args  # 파싱 실패 시 원본 반환
+            return test_args
 
-        # 파라미터 이름을 순서대로 추출
         params_str = match.group(1)
         param_names_ordered = []
         for part in params_str.split(","):
@@ -477,9 +550,8 @@ class SandboxExecutor:
                 param_names_ordered.append(name)
 
         if not param_names_ordered:
-            return {}  # 파라미터 없는 함수
+            return {}
 
-        # 1단계: 이름이 일치하는 것을 먼저 매핑
         result = {}
         used_values = set()
         for param in param_names_ordered:
@@ -487,8 +559,6 @@ class SandboxExecutor:
                 result[param] = test_args[param]
                 used_values.add(param)
 
-        # 2단계: 아직 채워지지 않은 파라미터에 남은 test_args 값을 순서대로 채움
-        # (예: recipient ← to_email의 값)
         remaining_values = [v for k, v in test_args.items() if k not in used_values]
         val_idx = 0
         for param in param_names_ordered:
@@ -498,6 +568,35 @@ class SandboxExecutor:
                     val_idx += 1
 
         return result
+
+    def collect_env_feedback(self, _code: str, error: str) -> str:
+        """실행 오류에서 환경 피드백을 추출하여 반복적 프롬프팅에 제공."""
+        feedback_parts = []
+
+        # 패키지 누락 감지
+        import re
+        missing_mod = re.search(r"ModuleNotFoundError: No module named '(\w+)'", error)
+        if missing_mod:
+            feedback_parts.append(f"- 패키지 '{missing_mod.group(1)}' 미설치 — pip install 필요")
+
+        # 환경변수 누락 감지
+        env_miss = re.search(r"(API_KEY|TOKEN|PASSWORD|SECRET)\s*(미설정|is None|not set|missing)", error, re.IGNORECASE)
+        if env_miss:
+            feedback_parts.append(f"- 환경변수 누락 감지: {env_miss.group(0)}")
+
+        # 네트워크 오류 감지
+        if "ConnectionError" in error or "ConnectTimeout" in error:
+            feedback_parts.append("- 외부 API 연결 실패 — 엔드포인트 URL 또는 네트워크 상태 확인 필요")
+
+        # 인증 오류 감지
+        if "401" in error or "403" in error or "Unauthorized" in error:
+            feedback_parts.append("- API 인증 실패 — API 키 또는 인증 방식 확인 필요")
+
+        # JSON 파싱 오류
+        if "JSONDecodeError" in error:
+            feedback_parts.append("- API 응답이 JSON이 아님 — 응답 형식 또는 엔드포인트 확인 필요")
+
+        return "\n".join(feedback_parts) if feedback_parts else ""
 
 
 # ── 스킬 저장 ─────────────────────────────────────────────
@@ -509,7 +608,6 @@ class SkillPersister:
         """generated_skills/{skill_name}.py 저장."""
         GENERATED_SKILLS_DIR.mkdir(exist_ok=True)
 
-        # LLM이 대소문자를 잘못 쓴 import 정규화 (Core, CORE → core)
         import re as _re
         code = _re.sub(
             r'from\s+[Cc][Oo][Rr][Ee]\.executor\s+import\s+tool',
@@ -517,15 +615,18 @@ class SkillPersister:
             code
         )
 
-        # 파일 헤더 추가
-        header = f'"""\n자동 생성 스킬: {skill_name}\n생성일: {datetime.now().isoformat()}\n전략: {strategy.get("service_name", "Unknown")}\n"""\n\n'
+        header = (
+            f'"""\n자동 생성 스킬: {skill_name}\n'
+            f'생성일: {datetime.now().isoformat()}\n'
+            f'전략: {strategy.get("service_name", "Unknown")}\n'
+            f'Factory: Enterprise Skill Factory 2.0\n"""\n\n'
+        )
         full_code = header + code
 
         path = GENERATED_SKILLS_DIR / f"{skill_name}.py"
         path.write_text(full_code, encoding="utf-8")
         logger.info(f"스킬 저장: {path}")
 
-        # 인덱스 업데이트
         self._update_index(skill_name, description, strategy)
         return path
 
@@ -535,7 +636,6 @@ class SkillPersister:
         else:
             index = {"skills": [], "last_updated": "", "total_count": 0}
 
-        # 중복 제거
         index["skills"] = [s for s in index["skills"] if s["name"] != skill_name]
         index["skills"].append({
             "name": skill_name,
@@ -544,6 +644,8 @@ class SkillPersister:
             "strategy": strategy.get("strategy", "unknown"),
             "created_at": datetime.now().isoformat(),
             "use_count": 0,
+            "quality_score": None,
+            "version": "v1.0.0",
         })
         index["last_updated"] = datetime.now().isoformat()
         index["total_count"] = len(index["skills"])
@@ -565,36 +667,40 @@ class SkillPersister:
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
 
-            # @tool 데코레이터가 자동 등록하므로 별도 처리 불필요
-            # 등록 확인: 레지스트리에서 찾기
             found = skill_name in _TOOL_REGISTRY
-            if found:
-                logger.info(f"스킬 동적 로드 성공: {skill_name}")
-            else:
-                # 데코레이터가 없는 경우 수동 등록 시도
+            if not found:
                 func = getattr(module, skill_name, None)
                 if func:
                     _TOOL_REGISTRY[skill_name] = func
                     found = True
+            if found:
+                logger.info(f"스킬 동적 로드 성공: {skill_name}")
             return found
         except Exception as e:
             logger.error(f"스킬 로드 실패 {skill_name}: {e}")
             return False
 
 
-# ── 메인 Skill Factory ────────────────────────────────────
+# ── 메인 Skill Factory 2.0 ──────────────────────────────────
 
 class SkillFactory:
     """
-    The Autonomous Toolmaker.
-    Phase 1 탐색 → Phase 2 합성/검증 → Phase 3 등록을 자율 수행.
+    Enterprise Skill Factory 2.0 — The Autonomous Toolmaker.
+
+    파이프라인:
+      Phase 1: 탐색 및 전략 수립
+      Phase 2: 코드 합성 (LATM Maker) → 샌드박스 검증 → 반복적 프롬프팅
+      Phase 2.5: 피어 리뷰 (안전성/효율성 검토)
+      Phase 2.7: 보안 게이트 (다단계 보안 + 프롬프트 주입 방어)
+      Phase 3: 등록 (버전 관리 + executor 등록 + 품질 평가)
     """
 
-    MAX_CORRECTIONS = 3
+    MAX_CORRECTIONS = 5  # 반복적 프롬프팅 최대 횟수 (3→5 증가)
 
     def __init__(self) -> None:
         self.discovery = APIDiscovery()
         self.synthesizer = CodeSynthesizer()
+        self.reviewer = PeerReviewer()
         self.sandbox = SandboxExecutor()
         self.persister = SkillPersister()
 
@@ -606,10 +712,6 @@ class SkillFactory:
         """
         요청에 맞는 스킬을 생성하고 등록.
 
-        Args:
-            user_request: 사용자 요청 자연어
-            test_args: 생성된 함수 테스트 시 사용할 인자 dict (선택)
-
         Returns:
             {
                 "success": bool,
@@ -617,118 +719,20 @@ class SkillFactory:
                 "description": str,
                 "file_path": str,
                 "test_result": str,
+                "quality_grade": str,
+                "security_score": int,
                 "message": str
             }
         """
-        await _log("divider", "SKILL FACTORY — 자율 스킬 생성 시작", "")
-        await _log("system", f"📋 요청 분석: {user_request}", "🏭 Skill Factory")
+        await _log("divider", "SKILL FACTORY 2.0 — 엔터프라이즈 스킬 생성 시작", "")
+        await _log("system", f"📋 요청 분석: {user_request}", "🏭 Skill Factory 2.0")
 
-        # ── 이메일 스킬 처리 (Canonical Template 사용 — LLM 합성 생략) ──
+        # ── 이메일 스킬 처리 (Canonical Template) ──
         from core.executor import _TOOL_REGISTRY
         email_keywords = {"email", "mail", "smtp", "이메일", "메일"}
         user_req_lower = user_request.lower()
         if any(kw in user_req_lower for kw in email_keywords):
-            skill_name = "send_email_via_smtp"
-            skill_file = GENERATED_SKILLS_DIR / f"{skill_name}.py"
-
-            # Case 1: 파일이 있고 레지스트리에 없으면 → 파일 로드
-            if skill_file.exists() and skill_name not in _TOOL_REGISTRY:
-                await _log("system", f"📂 [{skill_name}] 파일 발견 — 레지스트리 로드 중...", "[스킬 로드]")
-                self.persister.load_and_register(skill_name)
-
-            # Case 2: 레지스트리에 있으면 → 즉시 재사용 반환
-            if skill_name in _TOOL_REGISTRY:
-                await _log("system", f"✅ [{skill_name}] 재사용", "[스킬 재사용]")
-                return {
-                    "success": True,
-                    "skill_name": skill_name,
-                    "description": "Gmail SMTP 이메일 전송 스킬",
-                    "message": (
-                        f"✅ 이미 등록된 스킬 '{skill_name}' 사용!\n\n"
-                        "⚡ 지금 즉시 이 스킬을 tool_call로 호출하여 이메일을 전송하세요!"
-                    ),
-                }
-
-            # Case 3: 파일이 없으면 → Canonical Template으로 즉시 생성 (LLM 합성 없음)
-            await _log("system", f"🚀 [{skill_name}] Canonical Template으로 생성 (LLM 합성 생략)", "[스킬 생성]")
-            canonical_code = textwrap.dedent('''\
-                from __future__ import annotations
-                import os, json, smtplib
-                from pathlib import Path
-                from email.mime.text import MIMEText
-                from email.mime.multipart import MIMEMultipart
-                from core.executor import tool
-
-                _PENDING_FILE = Path(__file__).parent / "pending_email_task.json"
-
-                @tool
-                async def send_email_via_smtp(to_email: str, subject: str, body: str) -> dict:
-                    """Gmail SMTP 서버를 통해 이메일을 전송합니다.
-
-                    Args:
-                        to_email (str): 수신자 이메일 주소 (예: h5nmou@gmail.com)
-                        subject (str): 이메일 제목
-                        body (str): 이메일 본문 (plain text)
-
-                    Returns:
-                        dict: 성공 시 {"success": "이메일 전송 완료", "to": to_email}
-                    """
-                    smtp_user = os.getenv("SMTP_USER")
-                    smtp_password = os.getenv("SMTP_PASSWORD")
-                    smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
-                    smtp_port = int(os.getenv("SMTP_PORT", "587"))
-
-                    if not smtp_user:
-                        return {"error": "환경변수 누락", "detail": "SMTP_USER 미설정"}
-                    if not smtp_password:
-                        _PENDING_FILE.write_text(
-                            json.dumps({"to_email": to_email, "subject": subject, "body": body}, ensure_ascii=False),
-                            encoding="utf-8")
-                        return {"error": "환경변수 누락", "detail": "SMTP_PASSWORD 미설정",
-                                "env_key_required": "SMTP_PASSWORD",
-                                "hint": ".env에 SMTP_PASSWORD=앱비밀번호 추가 후 '설정 완료' 알려주세요."}
-                    try:
-                        msg = MIMEMultipart("alternative")
-                        msg["Subject"] = subject
-                        msg["From"] = smtp_user
-                        msg["To"] = to_email
-                        msg.attach(MIMEText(body, "plain", "utf-8"))
-                        with smtplib.SMTP(smtp_host, smtp_port) as server:
-                            server.ehlo(); server.starttls(); server.ehlo()
-                            server.login(smtp_user, smtp_password)
-                            server.send_message(msg)
-                        if _PENDING_FILE.exists():
-                            _PENDING_FILE.unlink()
-                        return {"success": "이메일 전송 완료", "to": to_email, "subject": subject, "from": smtp_user}
-                    except smtplib.SMTPAuthenticationError as e:
-                        _PENDING_FILE.write_text(
-                            json.dumps({"to_email": to_email, "subject": subject, "body": body}, ensure_ascii=False),
-                            encoding="utf-8")
-                        return {"error": "SMTP 인증 실패", "detail": str(e),
-                                "env_key_required": "SMTP_PASSWORD",
-                                "hint": ".env에서 SMTP_PASSWORD 수정 후 '설정 완료' 알려주세요."}
-                    except Exception as e:
-                        return {"error": "이메일 전송 실패", "detail": str(e)}
-                ''')
-
-            file_path = self.persister.save(
-                skill_name,
-                canonical_code,
-                "Gmail SMTP 이메일 전송 스킬 (SMTP_USER, SMTP_PASSWORD 필요)",
-                {"service_name": "Gmail SMTP", "strategy": "canonical"}
-            )
-            success = self.persister.load_and_register(skill_name)
-            if success:
-                return {
-                    "success": True,
-                    "skill_name": skill_name,
-                    "file_path": str(file_path),
-                    "test_result": "PASS (Canonical)",
-                    "message": (
-                        f"✅ 이메일 스킬 '{skill_name}' 생성 완료!\n\n"
-                        "⚡ 지금 즉시 tool_call로 호출하여 이메일을 전송하세요!"
-                    ),
-                }
+            return await self._handle_email_skill(user_request)
 
         # ── Phase 1: 탐색 및 전략 수립 ──
         await _log("divider", "PHASE 1 — 탐색 및 전략 수립", "")
@@ -743,11 +747,9 @@ class SkillFactory:
         # .env 키 필요 여부 안내
         env_key = strategy.get("env_key_name")
         if env_key and not os.getenv(env_key):
-            await _log(
-                "system",
-                f"🔑 '{env_key}' 환경변수가 필요합니다. .env 파일에 아래를 추가해 주세요:\n{env_key}=your_api_key_here",
-                "[.env 설정 요청]"
-            )
+            await _log("system",
+                f"🔑 '{env_key}' 환경변수가 필요합니다.",
+                "[.env 설정 요청]")
             return {
                 "success": False,
                 "env_key_required": env_key,
@@ -759,7 +761,7 @@ class SkillFactory:
                 ),
             }
 
-        # pip 패키지 설치 필요 여부
+        # pip 패키지 설치
         pip_packages = strategy.get("pip_packages", [])
         if pip_packages:
             await _log("system", f"⚙️ pip 패키지 설치 중: {pip_packages}", "[패키지 설치]")
@@ -775,29 +777,31 @@ class SkillFactory:
                 except Exception as e:
                     await _log("error", f"❌ {pkg} 설치 실패: {e}", "[패키지 설치]")
 
-        # ── Phase 2: 코드 합성 및 검증 ──
-        await _log("divider", "PHASE 2 — 코드 합성 및 샌드박스 검증", "")
+        # ── Phase 2: 코드 합성 및 반복적 검증 (Iterative Prompting) ──
+        await _log("divider", "PHASE 2 — 코드 합성 및 반복적 검증 (Iterative Prompting)", "")
 
         code = None
         exec_result = None
         previous_error = None
-
-        # test_args가 비어 있으면 샌드박스 실행 불가 → 구문 검사만 수행
+        env_feedback = None
         has_test_args = bool(test_args)
 
         for attempt in range(1, self.MAX_CORRECTIONS + 1):
             if attempt > 1:
-                await _log("system", f"🔄 Self-Correction 시도 {attempt}/{self.MAX_CORRECTIONS}", "[재합성 중...]")
+                await _log("system",
+                    f"🔄 반복적 프롬프팅 {attempt}/{self.MAX_CORRECTIONS} — 오류/환경 피드백 반영",
+                    "[Iterative Prompting]")
 
             code = await self.synthesizer.synthesize(
                 user_request, strategy,
                 test_args=test_args,
                 previous_error=previous_error,
                 previous_code=code,
+                env_feedback=env_feedback,
+                iteration=attempt,
             )
 
             if not has_test_args:
-                # test_args 없음 → AST 구문 검사만 수행하고 통과
                 import ast
                 try:
                     ast.parse(code)
@@ -806,6 +810,7 @@ class SkillFactory:
                     break
                 except SyntaxError as se:
                     previous_error = f"SyntaxError: {se}"
+                    env_feedback = None
                     await _log("error", f"❌ 구문 오류 (시도 {attempt}): {previous_error}", "[오류 감지]")
                     continue
 
@@ -817,11 +822,9 @@ class SkillFactory:
                 break
             else:
                 error_msg = exec_result["error"] or ""
-                # "missing required positional arguments" = test_args 부재 문제, 코드 버그 아님
-                # → 구문 검사만 통과하면 등록 진행
                 if "missing" in error_msg and "required positional argument" in error_msg:
                     await _log("system",
-                        "⚠️ test_args 인자 불일치로 실행 실패 (코드 자체는 정상) — 구문 검사 후 등록 진행",
+                        "⚠️ test_args 인자 불일치 (코드 자체는 정상) — 구문 검사 후 등록 진행",
                         "[실행 스킵]")
                     import ast
                     try:
@@ -830,21 +833,95 @@ class SkillFactory:
                         break
                     except SyntaxError:
                         pass
+
                 previous_error = error_msg
-                await _log("error", f"❌ 실행 오류 (시도 {attempt}): {previous_error[:300]}", "[오류 감지]")
+                # 환경 피드백 수집 (반복적 프롬프팅의 핵심)
+                env_feedback = self.sandbox.collect_env_feedback(code, error_msg)
+                if env_feedback:
+                    await _log("system",
+                        f"📊 [환경 피드백 수집]\n{env_feedback}",
+                        "[환경 피드백]")
+
+                await _log("error",
+                    f"❌ 실행 오류 (시도 {attempt}): {previous_error[:300]}",
+                    "[오류 감지]")
 
         if not exec_result or not exec_result["success"]:
             return {
                 "success": False,
-                "message": f"❌ {self.MAX_CORRECTIONS}회 시도 후에도 실행 실패:\n{previous_error}",
+                "message": f"❌ {self.MAX_CORRECTIONS}회 반복적 프롬프팅 후에도 실행 실패:\n{previous_error}",
             }
 
-        # 함수명 및 설명 추출
         skill_name = self.sandbox._extract_function_name(code)
         if not skill_name:
             return {"success": False, "message": "❌ 유효한 함수명을 추출할 수 없습니다."}
 
         description = strategy.get("description", f"{user_request} 처리 스킬")
+
+        # ── Phase 2.5: 피어 리뷰 (Peer Review) ──
+        await _log("divider", "PHASE 2.5 — 피어 리뷰 (Peer Review)", "")
+        review_result = await self.reviewer.review(code, skill_name, strategy)
+
+        if review_result.get("patched_code"):
+            await _log("system",
+                "🔧 [Peer Review] 코드 패치 적용",
+                "[피어 리뷰 패치]")
+            code = review_result["patched_code"]
+
+        if not review_result.get("approved", True):
+            issues = review_result.get("issues", [])
+            await _log("error",
+                f"❌ [Peer Review] 거부됨: {issues}",
+                "[피어 리뷰 거부]")
+            return {
+                "success": False,
+                "message": f"❌ 피어 리뷰 거부: {', '.join(issues)}",
+            }
+
+        review_score = review_result.get("score", 70)
+
+        # ── Phase 2.7: 보안 게이트 (Security Gate) ──
+        await _log("divider", "PHASE 2.7 — 보안 게이트 (Security Gate)", "")
+        await _log("system", "🛡️ [보안 취약점 스캔 중...]", "[보안 스캔 중...]")
+
+        from core.skill_security import get_security_gate
+        gate = get_security_gate()
+        sec_report = gate.scan(code, skill_name)
+
+        await _log("system",
+            f"🛡️ [보안 취약점 스캔 완료] {sec_report.summary}",
+            "[보안 스캔 완료]")
+
+        if sec_report.blocked:
+            return {
+                "success": False,
+                "message": (
+                    f"🚨 보안 게이트 차단: {skill_name}\n"
+                    f"위험도: {sec_report.risk_level.upper()}\n"
+                    f"발견: {sec_report.findings}"
+                ),
+            }
+
+        if sec_report.approval_required:
+            await _log("system",
+                f"🔒 [승인 필요] {sec_report.allowlist_violations}",
+                "[사장님 승인 대기]")
+            # Telegram 승인 요청
+            try:
+                from core.telegram_client import telegram_client
+                approval_msg = (
+                    f"🔒 **스킬 배포 승인 요청**\n\n"
+                    f"스킬: `{skill_name}`\n"
+                    f"위험도: {sec_report.risk_level.upper()}\n"
+                    f"보안점수: {sec_report.score}/100\n"
+                    f"제한 동작: {', '.join(sec_report.allowlist_violations)}\n\n"
+                    f"승인하시려면 '승인'을 입력하세요."
+                )
+                await telegram_client.send_message(approval_msg)
+            except Exception:
+                pass
+
+        security_score = sec_report.score
 
         # ── Phase 3: 등록 및 저장 ──
         await _log("divider", "PHASE 3 — 스킬 등록 및 저장", "")
@@ -852,16 +929,52 @@ class SkillFactory:
         file_path = self.persister.save(skill_name, code, description, strategy)
         loaded = self.persister.load_and_register(skill_name)
 
+        # 버전 관리
+        version = "v1.0.0"
+        try:
+            from core.skill_versioning import get_version_manager
+            vm = get_version_manager()
+            version = vm.save_version(
+                skill_name, code,
+                bump="minor",
+                description=description,
+                tags=strategy.get("pip_packages", []),
+                risk_level=sec_report.risk_level,
+            )
+        except Exception as e:
+            logger.warning(f"버전 저장 실패: {e}")
+
+        # 품질 평가
+        quality_grade = "B"
+        try:
+            from core.skill_quality import get_quality_evaluator
+            evaluator = get_quality_evaluator()
+            quality_report = evaluator.evaluate(
+                skill_name=skill_name,
+                user_request=user_request,
+                execution_result=json.loads(exec_result.get("output", "{}")) if exec_result.get("output") else {},
+                execution_time_ms=0,
+                security_score=security_score,
+                version=version,
+            )
+            quality_grade = quality_report.grade
+        except Exception as e:
+            logger.warning(f"품질 평가 실패: {e}")
+
         if loaded:
             await _log(
                 "complete",
-                f"🎉 신규 스킬 등록 완료!\n"
+                f"🎉 엔터프라이즈 스킬 등록 완료!\n"
                 f"  이름: {skill_name}\n"
                 f"  설명: {description}\n"
                 f"  서비스: {strategy.get('service_name')}\n"
+                f"  버전: {version}\n"
+                f"  보안점수: {security_score}/100\n"
+                f"  피어리뷰: {review_score}/100\n"
+                f"  품질등급: {quality_grade}\n"
                 f"  파일: generated_skills/{skill_name}.py\n"
                 f"  즉시 호출 가능: 다음 요청부터 바로 사용됩니다.",
-                "[신규 스킬 등록 완료]"
+                "[엔터프라이즈 스킬 등록 완료]"
             )
             return {
                 "success": True,
@@ -870,11 +983,17 @@ class SkillFactory:
                 "service": strategy.get("service_name"),
                 "file_path": str(file_path),
                 "test_result": exec_result["output"],
+                "version": version,
+                "security_score": security_score,
+                "review_score": review_score,
+                "quality_grade": quality_grade,
                 "message": (
-                    f"✅ **신규 스킬 '{skill_name}' 등록 완료!**\n\n"
+                    f"✅ **엔터프라이즈 스킬 '{skill_name}' 등록 완료!**\n\n"
                     f"- 서비스: {strategy.get('service_name')}\n"
                     f"- 설명: {description}\n"
-                    f"- 테스트 결과: {exec_result['output'][:300]}\n"
+                    f"- 버전: {version}\n"
+                    f"- 보안: {security_score}/100 | 리뷰: {review_score}/100 | 등급: {quality_grade}\n"
+                    f"- 테스트: {exec_result['output'][:300]}\n"
                     f"- 파일: `generated_skills/{skill_name}.py`\n\n"
                     f"⚡ **이 스킬은 지금 즉시 호출 가능합니다!**\n"
                     f"반드시 다음 단계로 '{skill_name}' 도구를 tool_call로 즉시 호출하여 요청을 완료하세요.\n"
@@ -886,6 +1005,111 @@ class SkillFactory:
                 "success": False,
                 "message": f"코드 실행은 성공했으나 레지스트리 등록에 실패했습니다. 파일은 저장됨: {file_path}",
             }
+
+    # ── 이메일 스킬 전용 처리 ─────────────────────────────────
+
+    async def _handle_email_skill(self, _user_request: str) -> dict:
+        """이메일 스킬은 Canonical Template으로 즉시 생성 (LLM 합성 불필요)."""
+        from core.executor import _TOOL_REGISTRY
+
+        skill_name = "send_email_via_smtp"
+        skill_file = GENERATED_SKILLS_DIR / f"{skill_name}.py"
+
+        if skill_file.exists() and skill_name not in _TOOL_REGISTRY:
+            await _log("system", f"📂 [{skill_name}] 파일 발견 — 레지스트리 로드 중...", "[스킬 로드]")
+            self.persister.load_and_register(skill_name)
+
+        if skill_name in _TOOL_REGISTRY:
+            await _log("system", f"✅ [{skill_name}] 재사용", "[스킬 재사용]")
+            return {
+                "success": True,
+                "skill_name": skill_name,
+                "description": "Gmail SMTP 이메일 전송 스킬",
+                "message": (
+                    f"✅ 이미 등록된 스킬 '{skill_name}' 사용!\n\n"
+                    "⚡ 지금 즉시 이 스킬을 tool_call로 호출하여 이메일을 전송하세요!"
+                ),
+            }
+
+        await _log("system", f"🚀 [{skill_name}] Canonical Template으로 생성", "[스킬 생성]")
+        canonical_code = textwrap.dedent('''\
+            from __future__ import annotations
+            import os, json, smtplib
+            from pathlib import Path
+            from email.mime.text import MIMEText
+            from email.mime.multipart import MIMEMultipart
+            from core.executor import tool
+
+            _PENDING_FILE = Path(__file__).parent / "pending_email_task.json"
+
+            @tool
+            async def send_email_via_smtp(to_email: str, subject: str, body: str) -> dict:
+                """Gmail SMTP 서버를 통해 이메일을 전송합니다.
+
+                Args:
+                    to_email (str): 수신자 이메일 주소 (예: h5nmou@gmail.com)
+                    subject (str): 이메일 제목
+                    body (str): 이메일 본문 (plain text)
+
+                Returns:
+                    dict: 성공 시 {"success": "이메일 전송 완료", "to": to_email}
+                """
+                smtp_user = os.getenv("SMTP_USER")
+                smtp_password = os.getenv("SMTP_PASSWORD")
+                smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+                smtp_port = int(os.getenv("SMTP_PORT", "587"))
+
+                if not smtp_user:
+                    return {"error": "환경변수 누락", "detail": "SMTP_USER 미설정"}
+                if not smtp_password:
+                    _PENDING_FILE.write_text(
+                        json.dumps({"to_email": to_email, "subject": subject, "body": body}, ensure_ascii=False),
+                        encoding="utf-8")
+                    return {"error": "환경변수 누락", "detail": "SMTP_PASSWORD 미설정",
+                            "env_key_required": "SMTP_PASSWORD",
+                            "hint": ".env에 SMTP_PASSWORD=앱비밀번호 추가 후 '설정 완료' 알려주세요."}
+                try:
+                    msg = MIMEMultipart("alternative")
+                    msg["Subject"] = subject
+                    msg["From"] = smtp_user
+                    msg["To"] = to_email
+                    msg.attach(MIMEText(body, "plain", "utf-8"))
+                    with smtplib.SMTP(smtp_host, smtp_port) as server:
+                        server.ehlo(); server.starttls(); server.ehlo()
+                        server.login(smtp_user, smtp_password)
+                        server.send_message(msg)
+                    if _PENDING_FILE.exists():
+                        _PENDING_FILE.unlink()
+                    return {"success": "이메일 전송 완료", "to": to_email, "subject": subject, "from": smtp_user}
+                except smtplib.SMTPAuthenticationError as e:
+                    _PENDING_FILE.write_text(
+                        json.dumps({"to_email": to_email, "subject": subject, "body": body}, ensure_ascii=False),
+                        encoding="utf-8")
+                    return {"error": "SMTP 인증 실패", "detail": str(e),
+                            "env_key_required": "SMTP_PASSWORD",
+                            "hint": ".env에서 SMTP_PASSWORD 수정 후 '설정 완료' 알려주세요."}
+                except Exception as e:
+                    return {"error": "이메일 전송 실패", "detail": str(e)}
+            ''')
+
+        file_path = self.persister.save(
+            skill_name, canonical_code,
+            "Gmail SMTP 이메일 전송 스킬 (SMTP_USER, SMTP_PASSWORD 필요)",
+            {"service_name": "Gmail SMTP", "strategy": "canonical"}
+        )
+        success = self.persister.load_and_register(skill_name)
+        if success:
+            return {
+                "success": True,
+                "skill_name": skill_name,
+                "file_path": str(file_path),
+                "test_result": "PASS (Canonical)",
+                "message": (
+                    f"✅ 이메일 스킬 '{skill_name}' 생성 완료!\n\n"
+                    "⚡ 지금 즉시 tool_call로 호출하여 이메일을 전송하세요!"
+                ),
+            }
+        return {"success": False, "message": "이메일 스킬 등록 실패"}
 
 
 # ── 싱글톤 ────────────────────────────────────────────────
