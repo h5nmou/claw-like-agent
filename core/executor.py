@@ -241,3 +241,83 @@ async def create_new_skill(user_request: str, test_args: dict = None) -> dict:
         user_request=user_request,
         test_args=test_args or {},
     )
+
+
+
+# ── 환경변수 동적 리로드 ──────────────────────────────────
+
+
+@tool
+async def reload_env() -> dict:
+    """
+    .env 파일을 다시 읽어 현재 프로세스에 반영합니다.
+    사용자가 .env 파일을 직접 수정한 후 이 도구를 호출하면 서버 재시작 없이 변경사항이 적용됩니다.
+
+    Returns:
+        dict: {"success": true, "loaded_keys": [...], "message": "..."}
+    """
+    import os
+    from pathlib import Path
+    try:
+        from dotenv import load_dotenv, dotenv_values
+    except ImportError:
+        import subprocess, sys
+        subprocess.run([sys.executable, "-m", "pip", "install", "python-dotenv", "-q"])
+        from dotenv import load_dotenv, dotenv_values
+
+    try:
+        env_path = Path(__file__).resolve().parent.parent / ".env"
+        if not env_path.exists():
+            return {"error": ".env 파일이 존재하지 않습니다."}
+
+        # 현재 .env 값 읽기
+        vals = dotenv_values(str(env_path))
+
+        # 프로세스에 즉시 반영
+        load_dotenv(str(env_path), override=True)
+
+        # 민감 정보는 마스킹하여 로드된 키 목록만 반환
+        loaded_keys = list(vals.keys())
+
+        # SMTP_PASSWORD 로드 여부 확인 (로드된 .env 파일 기준 — 시스템 환경 변수는 제외)
+        smtp_ok = "SMTP_PASSWORD" in loaded_keys and bool(vals.get("SMTP_PASSWORD"))
+
+        # 대기 중인 이메일 작업 확인 (send_email_via_smtp 실패 시 저장된 파라미터)
+        import json as _json
+        pending_file = env_path.parent / "generated_skills" / "pending_email_task.json"
+        pending_email = None
+        if smtp_ok and pending_file.exists():
+            try:
+                pending_email = _json.loads(pending_file.read_text(encoding="utf-8"))
+            except Exception:
+                pending_email = None
+
+        result = {
+            "success": True,
+            "loaded_keys": loaded_keys,
+            "smtp_ready": smtp_ok,
+            "message": (
+                f"✅ .env 재로드 완료.\n"
+                + ("✅ SMTP_PASSWORD 확인됨!" if smtp_ok
+                   else "⚠️ SMTP_PASSWORD 미설정 상태입니다.")
+            ),
+        }
+
+        if smtp_ok and pending_email:
+            result["pending_email"] = pending_email
+            result["message"] += (
+                f"\n\n⚡ **대기 중인 이메일 작업이 있습니다. 즉시 send_email_via_smtp를 호출하세요!**\n"
+                f"- to_email: {pending_email.get('to_email')}\n"
+                f"- subject: {pending_email.get('subject')}\n"
+                f"- body: {str(pending_email.get('body', ''))[:80]}...\n\n"
+                f"지금 즉시 위 파라미터로 send_email_via_smtp tool_call을 수행해야 합니다."
+            )
+        elif smtp_ok and not pending_email:
+            result["message"] += (
+                "\n\n📬 SMTP 준비 완료. 이전에 보내려던 이메일이 있었다면 수신자와 내용을 알려주세요.\n"
+                "예: 'h5nmou@gmail.com에 A사이트 예약 완료 안내 메일 보내줘'"
+            )
+
+        return result
+    except Exception as e:
+        return {"error": f".env 재로드 실패: {str(e)}"}

@@ -623,24 +623,110 @@ class SkillFactory:
         await _log("divider", "SKILL FACTORY — 자율 스킬 생성 시작", "")
         await _log("system", f"📋 요청 분석: {user_request}", "🏭 Skill Factory")
 
-        # ── 이미 등록된 스킬 감지 ──
-        # 요청 키워드로 기존 스킬 검색: email/smtp → send_email_via_smtp 등
+        # ── 이메일 스킬 처리 (Canonical Template 사용 — LLM 합성 생략) ──
         from core.executor import _TOOL_REGISTRY
         email_keywords = {"email", "mail", "smtp", "이메일", "메일"}
         user_req_lower = user_request.lower()
         if any(kw in user_req_lower for kw in email_keywords):
-            if "send_email_via_smtp" in _TOOL_REGISTRY:
-                await _log("system",
-                    "✅ 이미 등록된 이메일 스킬 감지 — 재생성 없이 기존 스킬 사용",
-                    "[스킬 재사용]")
+            skill_name = "send_email_via_smtp"
+            skill_file = GENERATED_SKILLS_DIR / f"{skill_name}.py"
+
+            # Case 1: 파일이 있고 레지스트리에 없으면 → 파일 로드
+            if skill_file.exists() and skill_name not in _TOOL_REGISTRY:
+                await _log("system", f"📂 [{skill_name}] 파일 발견 — 레지스트리 로드 중...", "[스킬 로드]")
+                self.persister.load_and_register(skill_name)
+
+            # Case 2: 레지스트리에 있으면 → 즉시 재사용 반환
+            if skill_name in _TOOL_REGISTRY:
+                await _log("system", f"✅ [{skill_name}] 재사용", "[스킬 재사용]")
                 return {
                     "success": True,
-                    "skill_name": "send_email_via_smtp",
-                    "description": "Gmail SMTP 이메일 전송 스킬 (기존 등록)",
+                    "skill_name": skill_name,
+                    "description": "Gmail SMTP 이메일 전송 스킬",
                     "message": (
-                        "✅ **이미 등록된 스킬 'send_email_via_smtp' 사용!**\n\n"
-                        "⚡ **지금 즉시 이 스킬을 tool_call로 호출하여 이메일을 전송하세요!**\n"
-                        "말로만 '사용하겠습니다'라고 하지 말고 실제 tool_call을 수행해야 합니다."
+                        f"✅ 이미 등록된 스킬 '{skill_name}' 사용!\n\n"
+                        "⚡ 지금 즉시 이 스킬을 tool_call로 호출하여 이메일을 전송하세요!"
+                    ),
+                }
+
+            # Case 3: 파일이 없으면 → Canonical Template으로 즉시 생성 (LLM 합성 없음)
+            await _log("system", f"🚀 [{skill_name}] Canonical Template으로 생성 (LLM 합성 생략)", "[스킬 생성]")
+            canonical_code = textwrap.dedent('''\
+                from __future__ import annotations
+                import os, json, smtplib
+                from pathlib import Path
+                from email.mime.text import MIMEText
+                from email.mime.multipart import MIMEMultipart
+                from core.executor import tool
+
+                _PENDING_FILE = Path(__file__).parent / "pending_email_task.json"
+
+                @tool
+                async def send_email_via_smtp(to_email: str, subject: str, body: str) -> dict:
+                    """Gmail SMTP 서버를 통해 이메일을 전송합니다.
+
+                    Args:
+                        to_email (str): 수신자 이메일 주소 (예: h5nmou@gmail.com)
+                        subject (str): 이메일 제목
+                        body (str): 이메일 본문 (plain text)
+
+                    Returns:
+                        dict: 성공 시 {"success": "이메일 전송 완료", "to": to_email}
+                    """
+                    smtp_user = os.getenv("SMTP_USER")
+                    smtp_password = os.getenv("SMTP_PASSWORD")
+                    smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+                    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+
+                    if not smtp_user:
+                        return {"error": "환경변수 누락", "detail": "SMTP_USER 미설정"}
+                    if not smtp_password:
+                        _PENDING_FILE.write_text(
+                            json.dumps({"to_email": to_email, "subject": subject, "body": body}, ensure_ascii=False),
+                            encoding="utf-8")
+                        return {"error": "환경변수 누락", "detail": "SMTP_PASSWORD 미설정",
+                                "env_key_required": "SMTP_PASSWORD",
+                                "hint": ".env에 SMTP_PASSWORD=앱비밀번호 추가 후 '설정 완료' 알려주세요."}
+                    try:
+                        msg = MIMEMultipart("alternative")
+                        msg["Subject"] = subject
+                        msg["From"] = smtp_user
+                        msg["To"] = to_email
+                        msg.attach(MIMEText(body, "plain", "utf-8"))
+                        with smtplib.SMTP(smtp_host, smtp_port) as server:
+                            server.ehlo(); server.starttls(); server.ehlo()
+                            server.login(smtp_user, smtp_password)
+                            server.send_message(msg)
+                        if _PENDING_FILE.exists():
+                            _PENDING_FILE.unlink()
+                        return {"success": "이메일 전송 완료", "to": to_email, "subject": subject, "from": smtp_user}
+                    except smtplib.SMTPAuthenticationError as e:
+                        _PENDING_FILE.write_text(
+                            json.dumps({"to_email": to_email, "subject": subject, "body": body}, ensure_ascii=False),
+                            encoding="utf-8")
+                        return {"error": "SMTP 인증 실패", "detail": str(e),
+                                "env_key_required": "SMTP_PASSWORD",
+                                "hint": ".env에서 SMTP_PASSWORD 수정 후 '설정 완료' 알려주세요."}
+                    except Exception as e:
+                        return {"error": "이메일 전송 실패", "detail": str(e)}
+                ''')
+
+            file_path = self.persister.save(
+                skill_name,
+                canonical_code,
+                "Gmail SMTP 이메일 전송 스킬 (SMTP_USER, SMTP_PASSWORD 필요)",
+                {"service_name": "Gmail SMTP", "strategy": "canonical"}
+            )
+            success = self.persister.load_and_register(skill_name)
+            if success:
+                return {
+                    "success": True,
+                    "skill_name": skill_name,
+                    "file_path": str(file_path),
+                    "test_result": "PASS (Canonical)",
+                    "message": (
+                        f"✅ 이메일 스킬 '{skill_name}' 생성 완료!\n\n"
+                        "⚡ 지금 즉시 tool_call로 호출하여 이메일을 전송하세요!"
                     ),
                 }
 

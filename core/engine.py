@@ -305,13 +305,99 @@ async def run_agent_loop(trigger_event: dict) -> dict:
 
     # ── Phase 4: Webhook 이벤트 수신 ──
     await broadcaster.emit("divider", "PHASE 4 — Webhook 이벤트 처리", "")
+
+    _trigger_msg = trigger_event.get("message", "") or ""
+    _email_keywords = {"이메일", "메일", "email", "mail", "smtp", "@gmail", "@naver", "@kakao"}
+    _done_keywords  = {"설정완료", "설정 완료", "설정했어", "완료", "입력했어", "비번 설정"}
+
+    _has_email_intent = ("@" in _trigger_msg) or any(kw in _trigger_msg.lower() for kw in _email_keywords)
+    _is_done_trigger  = any(kw in _trigger_msg for kw in _done_keywords)
+
+    _pending_email_file  = Path("generated_skills/pending_email_task.json")   # 스킬 실패 시 {to,subj,body}
+    _pending_intent_file = Path("generated_skills/pending_intent.json")         # 원본 요청 전체
+
+    # ── (A) 이메일 의도를 가진 원본 요청 저장 ──────────────────────────────
+    # "설정완료" 류가 아닌 일반 이메일 요청일 때 원본 메시지를 파일로 보존
+    if _has_email_intent and not _is_done_trigger:
+        try:
+            _pending_intent_file.write_text(
+                json.dumps({
+                    "original_message": _trigger_msg,
+                    "trigger_event": trigger_event,
+                    "saved_at": datetime.now().isoformat(),
+                }, ensure_ascii=False),
+                encoding="utf-8"
+            )
+            await broadcaster.emit("system",
+                f"💾 이메일 요청 저장 → pending_intent.json",
+                "[Pending 저장]")
+        except Exception:
+            pass
+
+    # ── (B) 미완료 작업 컨텍스트 주입 ─────────────────────────────────────
+    # 어떤 트리거든 pending 파일이 있으면 에이전트에게 작업 정보를 주입
+    pending_context = ""
+
+    if _pending_email_file.exists():
+        # 우선순위 1: 스킬 실패 시 저장한 정확한 이메일 파라미터
+        try:
+            _pe = json.loads(_pending_email_file.read_text(encoding="utf-8"))
+            # pending_intent도 있으면 원본 요청 로드
+            _orig_req = ""
+            if _pending_intent_file.exists():
+                try:
+                    _pi2 = json.loads(_pending_intent_file.read_text(encoding="utf-8"))
+                    _orig_req = f"\n원본 요청: \"{_pi2.get('original_message', '')}\""
+                except Exception:
+                    pass
+            pending_context = (
+                f"\n\n⚠️ **[이전 세션 미완료 작업 — 자동 복구]**\n"
+                f"SMTP 비밀번호 부재로 이메일 전송이 중단되었습니다.{_orig_req}\n\n"
+                f"지금 즉시 아래 순서로 **모든 작업**을 완료하세요:\n"
+                f"1. reload_env 호출하여 SMTP 설정 확인\n"
+                f"2. 원본 요청에 예약 생성이 포함된 경우 → get_site_a_bookings로 현재 상태 확인 후 미등록이면 create_site_a_booking 수행\n"
+                f"3. send_email_via_smtp 호출:\n"
+                f"   - to_email: {_pe.get('to_email')}\n"
+                f"   - subject: {_pe.get('subject')}\n"
+                f"   - body: {str(_pe.get('body', ''))[:200]}\n"
+                f"사용자에게 정보를 다시 요청하지 마세요."
+            )
+            await broadcaster.emit("system",
+                f"📌 pending_email_task 복구: {_pe.get('to_email')} / {_pe.get('subject')}",
+                "[Pending 복구]")
+        except Exception:
+            pending_context = ""
+
+    elif _pending_intent_file.exists():
+        # 우선순위 2: 원본 요청 메시지 (스킬이 호출되기 전에 중단된 경우)
+        try:
+            _pi = json.loads(_pending_intent_file.read_text(encoding="utf-8"))
+            _orig = _pi.get("original_message", "")
+            pending_context = (
+                f"\n\n⚠️ **[이전 세션 미완료 작업 — 자동 복구]**\n"
+                f"이전 세션에서 SMTP 비밀번호 부재로 중단된 작업이 있습니다.\n"
+                f"원본 요청: \"{_orig}\"\n\n"
+                f"아래 순서로 원본 요청의 **모든 작업**을 완료하세요:\n"
+                f"1. reload_env 호출하여 SMTP 설정 확인\n"
+                f"2. 원본 요청에 예약 생성이 포함된 경우 → get_site_a_bookings로 현재 상태 확인 후 미등록이면 create_site_a_booking 수행\n"
+                f"3. 원본 요청에서 수신자·제목·내용을 파악하여 send_email_via_smtp 즉시 호출\n"
+                f"사용자에게 정보를 다시 요청하지 마세요. 원본 요청에 모든 정보가 있습니다."
+            )
+            await broadcaster.emit("system",
+                f"📌 pending_intent 복구: {_orig[:60]}...",
+                "[Pending 복구]")
+        except Exception:
+            pending_context = ""
+
     trigger_text = (
         f"다음 이벤트가 발생했습니다. 적절한 조치를 취해주세요.\n\n"
         f"```json\n{json.dumps(trigger_event, ensure_ascii=False, indent=2)}\n```"
+        f"{pending_context}"
     )
     brain.add_user_message(trigger_text)
     memory.add_event("trigger", trigger_event)
     await broadcaster.emit("webhook", trigger_event, "📩 [SITE A] Webhook 수신")
+
     await broadcaster.emit(
         "system",
         "LLM에게 전달되는 메시지 구조:\n"
@@ -417,6 +503,17 @@ async def run_agent_loop(trigger_event: dict) -> dict:
                         f"⚡ 다음 루프에서 '{new_skill_name}'을 직접 호출하세요!",
                         "[Tool 목록 갱신]"
                     )
+
+                # 이메일 전송 성공 시 → pending 파일 정리
+                if tool_name == "send_email_via_smtp" and isinstance(result, dict) and result.get("success"):
+                    for _pf in [
+                        Path("generated_skills/pending_email_task.json"),
+                        Path("generated_skills/pending_intent.json"),
+                    ]:
+                        if _pf.exists():
+                            _pf.unlink()
+                    await broadcaster.emit("system", "🗑️ pending 파일 정리 완료 (이메일 전송 성공)", "[Pending 정리]")
+
 
     else:
         final_summary = "최대 반복 횟수에 도달하여 루프가 종료되었습니다."
