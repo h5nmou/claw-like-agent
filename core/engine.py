@@ -46,6 +46,12 @@ logger = logging.getLogger("engine")
 app = FastAPI(title="Universal Agent Engine", version="0.2.0")
 onboarding_mgr = OnboardingManager()
 
+# ── 원본 요청 컨텍스트 보존 저장소 ─────────────────────
+# 채팅/텔레그램으로 받은 원본 사용자 요청을 임시 보관.
+# 예약 확정 등의 Webhook이 발생하면 이 컨텍스트를 자동으로 주입하여
+# 새 에이전트 루프에서도 원본 요청(이메일 전송 등)을 이어서 처리한다.
+_pending_original_context = None  # type: dict | None
+
 # Phone-MCP 설정
 MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://192.168.0.20:8080")
 mcp_client = MCPClient(MCP_SERVER_URL)
@@ -94,9 +100,41 @@ async def startup_mcp_tools():
     await broadcaster.emit("system", f"✅ Phone-MCP 연동 완료 — 전체 도구 수: {len(all_tools)}개", "⚙️ MCP 연동")
 
 
+@app.on_event("startup")
+async def startup_skill_registry():
+    """generated_skills/ 내 저장된 모든 스킬을 자동 로드하고 Skill Factory log hook 연결."""
+    from core.skill_registry import get_skill_registry
+    from core.skill_factory import set_log_hook
+
+    await broadcaster.emit("divider", "PHASE 0.6 — Skill Library 로드", "")
+    await broadcaster.emit("system", "📚 스킬 라이브러리 초기화 중...", "⚙️ Skill Registry")
+
+    # broadcaster.emit을 skill_factory의 로그 훅으로 연결
+    set_log_hook(broadcaster.emit)
+
+    registry = get_skill_registry()
+    loaded_count = registry.load_all()
+    stats = registry.get_stats()
+
+    if loaded_count > 0:
+        skill_names = ", ".join(stats["skill_names"])
+        await broadcaster.emit(
+            "system",
+            f"✅ 스킬 라이브러리 로드 완료 — {loaded_count}개 스킬 활성화\n  등록 스킬: {skill_names}",
+            "📚 Skill Library"
+        )
+    else:
+        await broadcaster.emit(
+            "system",
+            "📭 저장된 스킬 없음 — 새 요청 시 자동 생성됩니다.",
+            "📚 Skill Library"
+        )
+
+
 # ── Telegram 봇 연동 ────────────────────────────────
 async def handle_telegram_message(text: str, chat_id: str):
     """텔레그램에서 수신된 메시지를 에이전트 루프로 전달."""
+    global _pending_original_context
     logger.info(f"Processing telegram message from {chat_id}: {text}")
     await broadcaster.emit("webhook", {"source": "Telegram", "msg": text}, "📲 Telegram 수신")
     
@@ -108,8 +146,18 @@ async def handle_telegram_message(text: str, chat_id: str):
         "message": text
     }
     
+    # 원본 사용자 요청을 전역 컨텍스트에 보관 (Webhook이 발생하면 주입됨)
+    _pending_original_context = {
+        "source": "telegram",
+        "chat_id": chat_id,
+        "original_message": text,
+    }
+
     # 에이전트 루프 실행
     result = await run_agent_loop(event)
+
+    # 루프 완료 후 컨텍스트 초기화
+    _pending_original_context = None
     
     # 에이전트가 처리한 최종 요약본을 텔레그램으로 답장 발송
     # 단, 에이전트가 직접 send_telegram_message 추가 툴을 호출하여 이미 버튼이나 메세지를 보냈다면 중복 발송 생략
@@ -370,6 +418,7 @@ async def run_agent_loop(trigger_event: dict) -> dict:
 @app.post("/chat")
 async def chat(request: Request):
     """대시보드 채팅창에서 보낸 명령 처리."""
+    global _pending_original_context
     data = await request.json()
     user_message = data.get("message", "")
     
@@ -385,8 +434,20 @@ async def chat(request: Request):
         "source": "dashboard_chat",
         "message": user_message
     }
-    
+
+    # 원본 사용자 요청을 전역 컨텍스트에 보관
+    # → 예약 확정(booking_confirmed) 등의 Webhook이 이 루프 실행 중에 발생하면,
+    #   /webhook 핸들러가 original_context를 Webhook 이벤트에 자동으로 주입하여
+    #   새 에이전트 루프도 원본 요청(이메일 전송 등)을 인지하고 처리한다.
+    _pending_original_context = {
+        "source": "dashboard_chat",
+        "original_message": user_message,
+    }
+
     result = await run_agent_loop(event)
+
+    # 루프 완료 후 컨텍스트 초기화
+    _pending_original_context = None
     
     return {"response": result.get("summary", "작업을 완료했습니다.")}
 
@@ -592,10 +653,42 @@ async def dashboard():
         .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 60vh; color: #484f58; gap: 1rem; }
         .empty-state .icon { font-size: 3rem; }
 
+        /* ── Skill Library Panel ── */
+        .skill-library-panel {
+            background: #0d1117; border-top: 1px solid #21262d;
+        }
+        .skill-library-header {
+            padding: 0.5rem 1.5rem; font-size: 0.78rem; font-weight: 700;
+            color: #39d353; display: flex; align-items: center; justify-content: space-between;
+            border-bottom: 1px solid #21262d; background: rgba(57,211,83,0.03);
+            cursor: pointer; user-select: none; transition: background 0.2s;
+        }
+        .skill-library-header:hover { background: rgba(57,211,83,0.06); }
+        .skill-cards {
+            display: flex; flex-wrap: wrap; gap: 0.5rem; padding: 0.6rem 1.2rem;
+            max-height: 120px; overflow-y: auto;
+        }
+        .skill-card {
+            background: rgba(57,211,83,0.06); border: 1px solid rgba(57,211,83,0.2);
+            border-radius: 8px; padding: 0.35rem 0.7rem; font-size: 0.7rem;
+            display: flex; flex-direction: column; gap: 0.1rem;
+            animation: fadeIn 0.4s ease-out; min-width: 140px; max-width: 220px;
+        }
+        .skill-card-name { color: #39d353; font-weight: 700; }
+        .skill-card-desc { color: #8b949e; font-size: 0.62rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .skill-card-service { color: #56d364; font-size: 0.58rem; }
+        .skill-card-delete {
+            background: none; border: none; cursor: pointer; color: #484f58;
+            font-size: 0.7rem; padding: 0; margin-top: 0.1rem; text-align: right;
+            transition: color 0.2s;
+        }
+        .skill-card-delete:hover { color: #f85149; }
+        .skill-empty { color: #484f58; font-size: 0.72rem; padding: 0.5rem 1.5rem; }
+
         /* ── Notary Table ── */
         .notary-panel {
             background: #0d1117; border-top: 1px solid #21262d;
-            max-height: 240px; overflow-y: auto; padding: 0;
+            max-height: 200px; overflow-y: auto; padding: 0;
         }
         .notary-header {
             padding: 0.6rem 1.5rem; font-size: 0.8rem; font-weight: 700;
@@ -678,7 +771,7 @@ async def dashboard():
         <div class="chat-panel">
             <div class="chat-header">💬 Agent Command Center</div>
             <div class="chat-body" id="chatBody">
-                <div class="chat-msg msg-agent">반갑습니다. 에이전트 C입니다. Phone-MCP가 연결되었습니다. 어떤 작업을 도와드릴까요?</div>
+                <div class="chat-msg msg-agent">반갑습니다. 당신의 AI 에이전트 입니다. 어떤 작업을 도와드릴까요?</div>
             </div>
             <div class="chat-input-area">
                 <textarea class="chat-input" id="chatInput" placeholder="에이전트에게 명령을 입력하세요... (Shift+Enter로 줄바꿈)" rows="2"></textarea>
@@ -703,6 +796,15 @@ async def dashboard():
                 </div>
             </div>
         </div>
+    </div>
+
+    <!-- Skill Library Panel -->
+    <div class="skill-library-panel" id="skillLibraryPanel">
+        <div class="skill-library-header" onclick="toggleSkillPanel()">
+            <span>🧩 Skill Library — 등록된 스킬 <span id="skillCount">0</span>개</span>
+            <span class="toggle-icon" id="skillToggleIcon" style="font-size:0.6rem;">▶</span>
+        </div>
+        <div class="skill-cards" id="skillCards" style="display:none;"></div>
     </div>
 
     <!-- Carrier Notary Table -->
@@ -775,7 +877,10 @@ async def dashboard():
         function appendChatMessage(role, text) {
             const div = document.createElement('div');
             div.className = 'chat-msg msg-' + role;
-            div.textContent = text;
+            // newline to <br>, preserve double spaces
+            div.innerHTML = escapeHtml(text)
+                .replace(/\\n/g, '<br>')
+                .replace(/  /g, '&nbsp; ');
             chatBody.appendChild(div);
             chatBody.scrollTop = chatBody.scrollHeight;
         }
@@ -876,6 +981,57 @@ async def dashboard():
         }
         loadNotary();
         setInterval(loadNotary, 3000);
+
+        // Skill Library
+        function toggleSkillPanel() {
+            const cards = document.getElementById('skillCards');
+            const icon = document.getElementById('skillToggleIcon');
+            const isHidden = cards.style.display === 'none';
+            cards.style.display = isHidden ? 'flex' : 'none';
+            icon.textContent = isHidden ? '▼' : '▶';
+            if (isHidden) loadSkills();
+        }
+
+        function loadSkills() {
+            fetch('/skills')
+                .then(r => r.json())
+                .then(data => {
+                    const skills = data.skills || [];
+                    document.getElementById('skillCount').textContent = skills.length;
+                    const cards = document.getElementById('skillCards');
+                    if (skills.length === 0) {
+                        cards.innerHTML = '<span class="skill-empty">📭 저장된 스킬 없음 — 대화창에서 새 기능을 요청하면 자동 생성됩니다.</span>';
+                        return;
+                    }
+                    cards.innerHTML = skills.map(s =>
+                        `<div class="skill-card">
+                            <span class="skill-card-name">⚡ ${escapeHtml(s.name)}</span>
+                            <span class="skill-card-desc">${escapeHtml(s.description || '')}</span>
+                            <span class="skill-card-service">🔧 ${escapeHtml(s.service || '')}</span>
+                            <button class="skill-card-delete" onclick="deleteSkill('${escapeHtml(s.name)}')" title="스킬 삭제">🗑️ 삭제</button>
+                        </div>`
+                    ).join('');
+                })
+                .catch(() => {});
+        }
+
+        async function deleteSkill(skillName) {
+            if (!confirm(`'${skillName}' 스킬을 삭제하시겠습니까?\n삭제하면 파일과 레지스트리에서 즉시 제거됩니다.`)) return;
+            try {
+                const resp = await fetch(`/skills/${encodeURIComponent(skillName)}`, { method: 'DELETE' });
+                const data = await resp.json();
+                if (resp.ok) {
+                    loadSkills();
+                } else {
+                    alert(`삭제 실패: ${data.error || '알 수 없는 오류'}`);
+                }
+            } catch(e) {
+                alert(`통신 오류: ${e}`);
+            }
+        }
+
+        loadSkills();
+        setInterval(loadSkills, 5000);
     </script>
 </body>
 </html>"""
@@ -923,6 +1079,20 @@ async def webhook(request: Request):
         event = await request.json()
         logger.info(f"Webhook received: {json.dumps(event, ensure_ascii=False)}")
 
+        # ── 원본 컨텍스트 자동 주입 ──────────────────────────────
+        # 사용자 명령(chat/telegram)이 처리 중일 때 Webhook이 도착하면,
+        # 원본 요청 메시지를 Webhook 이벤트에 주입하여 새 루프에 전달한다.
+        # 이를 통해 "이메일 보내줘" 등의 후속 작업이 컨텍스트 소실 없이 계속된다.
+        if _pending_original_context and "original_context" not in event:
+            event["original_context"] = _pending_original_context
+            logger.info(f"Injected original_context into webhook event: {_pending_original_context}")
+            await broadcaster.emit(
+                "system",
+                f"🔗 원본 컨텍스트 주입: '{_pending_original_context.get('original_message', '')[:60]}...'\n"
+                f"   → Webhook 루프가 원본 요청을 이어서 처리합니다.",
+                "🔗 Context Bridge"
+            )
+
         result = await run_agent_loop(event)
         return JSONResponse(content=result)
 
@@ -963,3 +1133,55 @@ async def onboarding_reset():
     """온보딩 초기화 (디버깅용)."""
     onboarding_mgr.reset()
     return {"status": "reset"}
+
+
+# ── Skill Library API ────────────────────────────────────
+
+@app.get("/skills")
+async def get_skills():
+    """등록된 생성 스킬 목록 반환."""
+    from core.skill_registry import get_skill_registry
+    registry = get_skill_registry()
+    return {
+        "skills": registry.get_all_skills(),
+        "stats": registry.get_stats(),
+    }
+
+
+@app.get("/skills/{skill_name}/code")
+async def get_skill_code(skill_name: str):
+    """특정 스킬의 소스 코드 반환 (감사 목적)."""
+    from pathlib import Path
+    skill_path = Path("generated_skills") / f"{skill_name}.py"
+    if not skill_path.exists():
+        return JSONResponse(status_code=404, content={"error": "Skill not found"})
+    return {"skill_name": skill_name, "code": skill_path.read_text(encoding="utf-8")}
+
+
+@app.delete("/skills/{skill_name}")
+async def delete_skill(skill_name: str):
+    """생성된 스킬을 완전히 삭제 (파일 + 레지스트리 + 인덱스)."""
+    from core.skill_registry import get_skill_registry
+    registry = get_skill_registry()
+
+    # 존재 여부 확인
+    all_skills = registry.get_all_skills()
+    skill_names = [s["name"] for s in all_skills]
+    if skill_name not in skill_names:
+        # 파일이 있을 수도 있으니 파일도 확인
+        from pathlib import Path
+        if not (Path("generated_skills") / f"{skill_name}.py").exists():
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"스킬 '{skill_name}'을 찾을 수 없습니다."}
+            )
+
+    result = registry.delete_skill(skill_name)
+
+    await broadcaster.emit(
+        "system",
+        f"🗑️ 스킬 삭제 완료: {skill_name}\n{result['message']}",
+        "🗑️ Skill 삭제"
+    )
+
+    return result

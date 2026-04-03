@@ -150,17 +150,31 @@ async def execute(tool_name: str, arguments: dict[str, Any]) -> Any:
 @tool
 def list_all_available_tools() -> dict:
     """
-    현재 시스템에 등록된 모든 도구(로컬 및 Phone-MCP 원격 도구)의 이름과 설명을 반환합니다.
+    현재 시스템에 등록된 모든 도구(로컬 및 Phone-MCP 원격 도구, 자동 생성 스킬 포함)의 이름과 설명을 반환합니다.
     사용자가 '어떤 기능이 있어?', '도구 목록 보여줘'라고 물어볼 때 이 도구를 사용하여 목록을 확인하세요.
     """
+    from core.skill_registry import get_skill_registry
+    registry = get_skill_registry()
+    generated_skill_names = {s["name"] for s in registry.get_all_skills()}
+
     tools_list = []
     for name, func in _TOOL_REGISTRY.items():
-        # 첫 번째 줄의 docstring을 설명으로 취급
         doc = func.__doc__
         desc = doc.strip().split("\n")[0] if doc else "설명 없음"
-        tools_list.append({"name": name, "description": desc})
-    
-    return {"registered_tools": tools_list}
+        tag = ""
+        if "[PHONE-MCP]" in desc:
+            tag = "[PHONE-MCP] "
+            desc = desc.replace("[PHONE-MCP] ", "")
+        elif name in generated_skill_names:
+            tag = "[생성된 스킬] "
+        tools_list.append({"name": name, "tag": tag, "description": tag + desc})
+
+    stats = registry.get_stats()
+    return {
+        "registered_tools": tools_list,
+        "total": len(tools_list),
+        "generated_skill_count": stats["total_skills"],
+    }
 
 
 from core.telegram_client import telegram_client
@@ -203,3 +217,27 @@ async def send_telegram_message(message: str, buttons: list[str] = None) -> dict
 def get_registered_tools() -> list[str]:
     """등록된 Tool 이름 목록 반환."""
     return list(_TOOL_REGISTRY.keys())
+
+
+# ── Skill Factory 진입점 ──────────────────────────────────
+
+@tool
+async def create_new_skill(user_request: str, test_args: dict = None) -> dict:
+    """
+    기존 Tool로 처리 불가능한 요청을 받으면 이 도구를 호출하여 새 스킬을 자율 생성합니다.
+    [3단계: API 탐색 → 코드 합성/검증 → 레지스트리 등록]을 자동으로 수행하며, 성공 시 즉시 사용 가능한 신규 Tool이 등록됩니다.
+
+    Args:
+        user_request (str): 사용자의 요청 자연어 설명 (예: "서울 현재 날씨 알려줘", "환율 조회 기능 만들어줘")
+        test_args (dict): 생성된 함수 테스트용 인자 dict (예: {"city": "Seoul"}). 없으면 빈 dict 전달.
+
+    Returns:
+        성공 시: {"success": true, "skill_name": ..., "description": ..., "test_result": ..., "message": ...}
+        실패 시: {"success": false, "message": ..., "env_key_required": ... (선택)}
+    """
+    from core.skill_factory import get_skill_factory
+    factory = get_skill_factory()
+    return await factory.create_skill(
+        user_request=user_request,
+        test_args=test_args or {},
+    )

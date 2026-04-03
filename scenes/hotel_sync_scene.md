@@ -31,3 +31,10 @@
 ### 제약 조건
 - 예약 데이터의 `room_id`, `check_in`, `check_out` 필드는 필수입니다.
 - 날짜 형식은 `YYYY-MM-DD`입니다.
+
+### original_context 후속 작업 (CRITICAL)
+이벤트 JSON에 `original_context` 필드가 포함되어 있으면:
+- Site B 동기화가 완료된 직후, `original_context.original_message` 내용을 확인한다.
+- 원본 요청에 이메일 전송(`@` 포함 이메일 주소), 텔레그램 알림 등 **아직 수행되지 않은 작업**이 있으면 반드시 이어서 처리한다.
+- 이메일 Tool이 없는 경우 → `create_new_skill`을 호출하여 이메일 스킬을 먼저 생성한 후 전송한다.
+- **"이메일 전송 작업을 이어서 수행하겠습니다"라는 말만 하고 루프를 종료하는 것은 금지한다. 실제로 Tool을 호출해야 한다.**
