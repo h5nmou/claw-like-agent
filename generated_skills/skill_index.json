@@ -1,14 +1,5 @@
 {
-  "skills": [
-    {
-      "name": "send_email_via_smtp",
-      "description": "Gmail SMTP 이메일 전송 스킬 (SMTP_USER, SMTP_PASSWORD 필요)",
-      "service": "Gmail SMTP",
-      "strategy": "canonical",
-      "created_at": "2026-04-03T16:42:24.595012",
-      "use_count": 0
-    }
-  ],
-  "last_updated": "2026-04-03T16:42:24.595016",
-  "total_count": 1
+  "skills": [],
+  "last_updated": "2026-04-06T15:28:55.052114",
+  "total_count": 0
 }
