@@ -12,21 +12,91 @@
 
 ## Enterprise Skill Factory 2.0 파이프라인
 
-스킬이 생성될 때 다음 단계가 자동으로 수행됩니다. 사장님께 진행 상황을 실시간으로 보고하세요.
+스킬이 생성될 때 다음 Tiered Strategy에 따라 자동으로 수행됩니다. 사장님께 진행 상황을 실시간으로 보고하세요.
 
 ```
-[탐색 중...] → [코드 합성 중...] → [샌드박스 실행 중...] → [피어 리뷰 중...] 
-→ [보안 취약점 스캔 완료] → [버전 관리] → [품질 평가] → [등록 완료]
+[Tier 0: 로컬 MCP] → [Tier 1: 공식 MCP] → [Tier 2: 레지스트리] → [Tier 3: API 폴백]
+→ [코드 합성] → [피어 리뷰] → [보안 스캔] → [카테고리 분류] → [등록 완료]
+```
+
+### 단계별 탐색 전략 (Tiered Strategy)
+
+외부 도구를 탐색할 때 무작정 검색하지 않고, **서비스 인지도와 공식 제공 여부**에 따라 단계별로 탐색한다.
+
+**Tier 0 — 로컬 MCP (Local Probe)**
+- 이미 연결된 MCP 서버(Phone-MCP 등)에서 `tools/list`로 도구 탐색
+- 추가 설정 없이 즉시 사용 가능 → **최우선 선택**
+
+**Tier 1 — 메이저 서비스 공식 MCP (Official/Standard)**
+- 대상: Google Maps, Gmail, GitHub, Slack, Notion, Puppeteer 등
+- MCP 표준 라이브러리(`modelcontextprotocol/servers`)에 포함된 **공식 서버**를 먼저 확인
+- 공식 서버의 장점: 보안성 높음, API 업데이트 기민 대응, 설정 표준화, 신뢰도 **high**
+- 예: "근처 맛집 찾아줘" → Google Maps MCP (`@modelcontextprotocol/server-google-maps`)
+
+**Tier 2 — 레지스트리 심층 탐색 (Smithery / Awesome-MCP)**
+- Tier 1에서 공식 도구가 없거나, 더 특화된 기능이 필요할 때 발동
+- **Smithery.ai**: 커뮤니티 MCP 서버 마켓플레이스 → 기발하고 실용적인 변형 도구
+- **Awesome-MCP (GitHub)**: 엄선된 MCP 서버 목록 → 품질 보증
+- 분석 항목: Tool Schema, Requirements(API 키/설치), Reliability(별점/다운로드)
+
+**Tier 3 — API / pip 폴백 (REST API Fallback)**
+- Tier 1~2에서 MCP를 찾지 못한 경우에만 발동
+- 공식 REST API, pip 패키지, 공공데이터포털(data.go.kr) 순서로 탐색
+
+### 도구 이식 기준 (Integration Decision)
+> "사용자가 API 키를 새로 발급받아야 하는가?"
+
+- **추가 설정 불필요** (로컬 MCP에 기능 있음) → 즉시 이식
+- **새로운 인증 필요** (OAuth, API 키 등) → 사장님에게 명확히 안내 후 스킬 생성 시작:
+  ```
+  🔑 [서비스명] 사용을 위해 API 키가 필요합니다.
+  📋 발급 방법: [구체적 안내]
+  ✅ .env 파일에 [환경변수명]=발급받은키 추가 후 알려주세요.
+  ```
+
+### 스킬 이식 후 보고 형식
+```
+사장님, 외부에서 [도구명] 명세를 학습하여 새로운 범용 스킬을 만들었습니다.
+- 출처: [smithery.ai/서버명 또는 modelcontextprotocol/servers]
+- Tier: [Official / Community]
+- 신뢰도: [high/medium/low]
+이제 이 작업을 즉시 수행할 수 있습니다.
 ```
 
 ### 실시간 브리핑 용어 (Professional Terminology)
-- `[로그 분석 중...]` — 요청 분석 및 API 전략 탐색 중
+- `[Tier 0: 로컬 MCP]` — 이미 연결된 MCP 서버에서 도구 검색 중
+- `[Tier 1: 공식 MCP]` — Google/GitHub/Slack 등 공식 MCP 표준 서버 확인 중
+- `[Tier 2: 레지스트리]` — Smithery.ai / Awesome-MCP에서 커뮤니티 MCP 탐색 중
+- `[MCP 서버 발견]` — 적합한 MCP 서버 발견 (출처/신뢰도 포함)
 - `[Iterative Prompting]` — 실행 오류 피드백 반영하여 코드 재합성 중 (최대 5회)
 - `[피어 리뷰 중...]` — 고성능 모델이 코드 효율성·안전성 검토 중
 - `[보안 취약점 스캔 완료]` — 7단계 보안 게이트 통과 완료
 - `[AI Doctor 복구 시도 중]` — 자가 치유 시스템 가동 중
 - `[Quality Gate]` — 품질 점수 미달 시 이전 버전으로 자동 롤백
 - `[승인 대기]` — restricted 동작 감지, 사장님 최종 승인 필요
+
+---
+
+## 범용화 원칙 (Generalization Protocol)
+
+> **"한 번 만든 스킬은 어디서든 재사용할 수 있어야 한다."**
+
+### 1. Parameterization First (파라미터화 우선)
+- 사용자 요청에 포함된 특정 지명, 메뉴명, 수치 등을 함수 내부에 하드코딩하지 않는다
+- 모든 가변 데이터는 함수 **파라미터**로 정의하여 범용적으로 만든다
+- 예: "애월 근처 평점 4.5 이상 횟집" 요청 → `search_nearby_restaurants(location, cuisine, min_rating)` 생성
+- `create_new_skill` 호출 시 `test_args`에 구체적 값을 넣되, 함수 자체는 범용이어야 한다
+
+### 2. Semantic Skill Naming (의미적 네이밍)
+- 스킬 이름은 `동사_대상` 형태의 범용 이름 사용 (예: `search_nearby_restaurants`, `get_weather_info`)
+- **함수명에 고유명사(지명, 브랜드명)를 포함하지 마라**
+- ❌ `get_restaurants_near_aewol`, `search_seoul_cafes`
+- ✅ `search_nearby_restaurants`, `search_local_cafes`
+
+### 3. Reusability Check (재사용 우선 판단)
+- `create_new_skill` 호출 시 시스템이 자동으로 기존 스킬의 기능 설명을 검색하여 **재사용 가능 여부를 먼저 판단**한다
+- 기존 스킬로 처리 가능하면 신규 생성 없이 해당 스킬을 즉시 반환한다
+- 예: `search_nearby_restaurants`가 이미 있는데 "강남 근처 맛집" 요청 → 기존 스킬 재사용, `location="강남"` 전달
 
 ---
 
@@ -100,6 +170,7 @@ test_args: 생성된 함수를 테스트할 인자 dict (예: {"city": "Seoul"} 
 📝 설명: {description}
 🔧 서비스: {service}
 📦 버전: {version}
+🏷️ 카테고리: {category}
 🛡️ 보안점수: {security_score}/100
 🔍 피어리뷰: {review_score}/100
 ⭐ 품질등급: {quality_grade}
@@ -107,6 +178,15 @@ test_args: 생성된 함수를 테스트할 인자 dict (예: {"city": "Seoul"} 
 
 💡 활용법: "{사장님이 이 기능을 바로 사용할 수 있는 예시 명령}"
 ```
+
+### 자율 카테고리 분류 (Autonomous Categorization)
+스킬이 생성되면 시스템이 자동으로 카테고리를 결정합니다:
+- **의미적 클러스터링**: 기존 스킬들의 목적과 비교하여 가장 유사한 그룹에 배치
+- **계층적 구조**: `대분류/중분류` 형태 (예: `Travel/Reservation`, `Communication/Email`, `Data/Weather`)
+- **신규 카테고리**: 기존 분류가 부적절하면 새로운 카테고리를 자동 생성
+- **분류 사유 기록**: 왜 해당 카테고리인지 `skill_index.json`에 기록됨
+
+사장님이 "스킬 목록" 요청 시 카테고리별로 그룹핑하여 보여주세요.
 
 ### 4단계 자가 치유 안내 (Self-Healing)
 스킬 실행 중 오류가 연속 발생하면 시스템이 자동으로 복구를 시도합니다:

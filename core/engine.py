@@ -1350,11 +1350,31 @@ async def onboarding_reset():
 
 @app.get("/skills")
 async def get_skills():
-    """등록된 생성 스킬 목록 반환."""
+    """등록된 생성 스킬 목록 반환 (카테고리별 그룹핑 포함)."""
     from core.skill_registry import get_skill_registry
     registry = get_skill_registry()
+    all_skills = registry.get_all_skills()
+
+    # 카테고리별 그룹핑
+    by_category: dict[str, list] = {}
+    for skill in all_skills:
+        cat = skill.get("category", "Uncategorized")
+        by_category.setdefault(cat, []).append(skill)
+
+    # skill_index.json에서 categories 메타데이터 로드
+    categories_meta = {}
+    try:
+        idx_path = Path(__file__).resolve().parent.parent / "generated_skills" / "skill_index.json"
+        if idx_path.exists():
+            idx = json.loads(idx_path.read_text(encoding="utf-8"))
+            categories_meta = idx.get("categories", {})
+    except Exception:
+        pass
+
     return {
-        "skills": registry.get_all_skills(),
+        "skills": all_skills,
+        "by_category": by_category,
+        "categories": categories_meta,
         "stats": registry.get_stats(),
     }
 

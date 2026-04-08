@@ -1,5 +1,13 @@
 {
   "skills": [],
-  "last_updated": "2026-04-06T15:28:55.052114",
-  "total_count": 0
+  "last_updated": "2026-04-07T12:07:51.095886",
+  "total_count": 0,
+  "categories": {
+    "Travel/Restaurant Search": {
+      "description": "여행지 근처의 식당 정보를 검색하는 서비스",
+      "skills": [
+        "search_nearby_restaurants"
+      ]
+    }
+  }
 }
