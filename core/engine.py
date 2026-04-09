@@ -10,7 +10,7 @@ import asyncio
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -25,11 +25,13 @@ from core.memory import Memory
 from core.onboarding_manager import OnboardingManager
 from core.mcp_client import MCPClient
 from core.telegram_client import telegram_client
+from core.proactive_care import get_care_engine, set_care_log_hook, save_pending_proposals, get_pending_proposal, clear_pending_proposals, save_pending_auto_rule, get_pending_auto_rule, clear_pending_auto_rule
 
 # Tool 모듈을 import하여 @tool 데코레이터가 실행되도록 함
 import tools.site_a_api  # noqa: F401
 import tools.site_b_api  # noqa: F401
 import tools.telco_auth_api  # noqa: F401
+import tools.proactive_care_api  # noqa: F401
 
 load_dotenv()
 
@@ -40,6 +42,11 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("engine")
+
+# 반복 로그 억제 — 정상 요청은 숨기고 에러만 표시
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 # ── FastAPI 앱 ───────────────────────────────────────
 
@@ -110,9 +117,10 @@ async def startup_skill_registry():
     await broadcaster.emit("divider", "PHASE 0.6 — Enterprise Skill Ecosystem 초기화", "")
     await broadcaster.emit("system", "📚 [로그 분석 중...] 스킬 라이브러리 초기화...", "⚙️ Skill Registry")
 
-    # broadcaster.emit을 skill_factory 및 self-healer의 로그 훅으로 연결
+    # broadcaster.emit을 skill_factory, self-healer, proactive care의 로그 훅으로 연결
     set_log_hook(broadcaster.emit)
     set_briefing_hook(broadcaster.emit)
+    set_care_log_hook(broadcaster.emit)
 
     registry = get_skill_registry()
     loaded_count = registry.load_all()
@@ -134,9 +142,16 @@ async def startup_skill_registry():
             "📚 Skill Library"
         )
 
-    # 품질 평가기 초기화
+    # 품질 평가기 초기화 + 오래된 로그 정리
     from core.skill_quality import get_quality_evaluator
     evaluator = get_quality_evaluator()
+    stale_removed = evaluator.cleanup_stale_entries()
+    if stale_removed:
+        await broadcaster.emit(
+            "system",
+            f"🧹 quality_log.json 정리: 삭제된 스킬 로그 {stale_removed}건 제거",
+            "⚙️ Quality Monitor"
+        )
     quality_stats = evaluator.get_dashboard_stats()
     if quality_stats:
         critical_skills = [name for name, s in quality_stats.items() if s["status"] == "critical"]
@@ -169,12 +184,172 @@ async def handle_telegram_message(text: str, chat_id: str):
     
     event = {
         "event": "user_command",
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "source": "telegram",
         "chat_id": chat_id,
         "message": text
     }
-    
+
+    # ── Proactive Care 콜백 처리 (텔레그램 버튼 클릭) ──
+    if text.startswith("care_"):
+        proposal_info = get_pending_proposal(text)
+        if proposal_info:
+            clear_pending_proposals()
+
+            if proposal_info["type"] == "dismiss":
+                await broadcaster.emit("system", "❌ 사장님이 케어 제안을 무시했습니다.", "[선제적 케어]")
+                await telegram_client.send_message("케어 제안을 무시합니다.", user_id=chat_id)
+                return
+
+            # 승인된 제안 내용을 이벤트에 주입
+            analysis = proposal_info["analysis"]
+
+            _proposals_for_event = []  # 이벤트에 주입할 제안 목록
+
+            if proposal_info["type"] == "approve_one":
+                _proposals_for_event = [proposal_info["proposal"]]
+            elif proposal_info["type"] == "approve_all":
+                _proposals_for_event = proposal_info["proposals"]
+
+            # 각 제안의 상세 실행 단계 생성
+            _steps_text = ""
+            for i, p in enumerate(_proposals_for_event, 1):
+                _steps_text += f"\n--- 제안 {i} ---\n"
+                _steps_text += f"액션: {p['action']}\n"
+                _steps_text += f"사유: {p['reason']}\n"
+                if p.get("requires_skill") and p.get("skill_request"):
+                    _steps_text += f"필요 스킬: {p['skill_request']}\n"
+                    if p.get("skill_test_args"):
+                        _steps_text += f"스킬 테스트 인자: {json.dumps(p['skill_test_args'], ensure_ascii=False)}\n"
+
+            event["message"] = (
+                f"사장님이 선제적 케어 제안을 승인했습니다.\n"
+                f"\n== 승인된 제안 ==\n{_steps_text}\n"
+                f"\n== 실행 지침 ==\n"
+                f"각 제안에 대해 아래 단계를 순서대로 실행하세요:\n\n"
+                f"  STEP 1 [MCP 기반 스킬 생성 — 최우선]:\n"
+                f"    ⛔ create_local_guide, web_search는 폴백 도구이므로 이 단계에서 절대 사용 금지!\n"
+                f"    → 반드시 create_new_skill 을 호출하세요.\n"
+                f"    → Skill Factory가 Smithery.ai에서 특화 MCP 서버를 자동 탐색합니다.\n"
+                f"       예: 장소/맛집 → Google Maps MCP, 날씨 → Weather MCP\n"
+                f"    → create_new_skill이 실패를 반환한 경우에만 STEP 1-B로 진행\n\n"
+                f"  STEP 1-B [웹 검색 폴백 — create_new_skill 실패 시에만]:\n"
+                f"    → create_new_skill이 실패/mcp_install_required를 반환한 경우에만\n"
+                f"    → create_local_guide 또는 web_search 사용 가능\n\n"
+                f"  STEP 2 [액션 실행]: 생성된 스킬 또는 폴백 결과로 실제 작업 수행\n"
+                f"    ⚠️ LLM 학습 데이터만으로 장소를 지어내는 것은 금지! 반드시 외부 데이터 소스 사용.\n\n"
+                f"  STEP 3 [투숙객 전달]: 결과물을 투숙객 이메일로 전송 (send_email_via_smtp 또는 스킬 생성)\n\n"
+                f"  STEP 4 [보고]: send_telegram_message로 사장님에게 실행 결과 + 데이터 소스 보고\n\n"
+                f"  STEP 5 [자동화 등록 질문]: propose_care_automation 도구를 호출하세요.\n"
+                f"    → 이 도구가 사장님에게 텔레그램으로 자동화 등록 여부를 질문합니다.\n"
+                f"    → 사장님이 승인하면 시스템이 자동으로 규칙을 등록합니다.\n"
+                f"    ⛔ register_care_rule을 직접 호출하지 마세요!\n"
+                f"\n⚠️ 규칙 등록만 하고 끝내지 마세요! STEP 1~4를 반드시 먼저 수행하세요.\n"
+                f"⚠️ 환경변수가 여러 개 필요하면 한꺼번에 요구하지 말고, 현재 STEP에 필요한 것만 안내 후 멈추세요.\n"
+            )
+
+            # 투숙객 정보도 주입
+            if analysis.get("analysis"):
+                event["message"] += f"\n상황 분석: {analysis['analysis']}"
+
+            # 영향 받는 투숙객의 이메일 정보 명시 (LLM이 추측하지 않도록)
+            _affected = analysis.get("_affected_bookings", [])
+            if _affected:
+                _guest_lines = "\n".join(
+                    f"  - {b.get('guest_name', '?')}: {b.get('guest_email', '이메일 없음')} "
+                    f"(체크인: {b.get('check_in', '?')}, 체크아웃: {b.get('check_out', '?')})"
+                    for b in _affected
+                )
+                event["message"] += (
+                    f"\n\n== 투숙객 정보 (이메일 전송 시 반드시 이 주소를 사용하세요) ==\n{_guest_lines}"
+                )
+
+            # proposals 원본도 포함 (투숙객 이메일 등 참조용)
+            if analysis.get("proposals"):
+                event["proactive_care_approved_proposals"] = _proposals_for_event
+
+            # 케어 작업 pending 파일 저장 (env_key_required 발생 시 복구용)
+            try:
+                Path("generated_skills/pending_care_task.json").write_text(
+                    json.dumps({
+                        "proposals": _proposals_for_event,
+                        "analysis": analysis,
+                        "affected_bookings": analysis.get("_affected_bookings", []),
+                        "event_message": event["message"],
+                        "saved_at": datetime.now().isoformat(),
+                    }, ensure_ascii=False),
+                    encoding="utf-8"
+                )
+            except Exception:
+                pass
+
+            await broadcaster.emit("system",
+                f"✅ 사장님이 케어 제안을 승인: {text}",
+                "[선제적 케어]")
+        else:
+            event["message"] = f"사장님이 '{text}'를 선택했지만, 대기 중인 케어 제안이 없습니다."
+
+    # ── 자동화 규칙 등록 승인/거부 콜백 ──
+    elif text == "auto_rule_yes":
+        pending_rule = get_pending_auto_rule()
+        if pending_rule:
+            clear_pending_auto_rule()
+            care_engine = get_care_engine()
+            result = care_engine.register_rule(
+                trigger_category=pending_rule["trigger_category"],
+                approved_action=pending_rule["approved_action"],
+                skill_name=pending_rule.get("skill_name"),
+            )
+            await broadcaster.emit(
+                "system",
+                f"✅ 자동화 규칙 등록 완료: {pending_rule['approved_action']}",
+                "[선제적 케어]",
+            )
+            await telegram_client.send_message(
+                f"✅ 자동화 규칙이 등록되었습니다.\n"
+                f"- 트리거: {pending_rule['trigger_category']}\n"
+                f"- 액션: {pending_rule['approved_action']}\n"
+                f"- 스킬: {pending_rule.get('skill_name', '없음')}\n\n"
+                f"다음에 동일 조건 발생 시 자동으로 제안됩니다.",
+                user_id=chat_id,
+            )
+        else:
+            await telegram_client.send_message(
+                "대기 중인 자동화 규칙이 없습니다.", user_id=chat_id
+            )
+        return
+
+    elif text == "auto_rule_no":
+        pending_rule = get_pending_auto_rule()
+        clear_pending_auto_rule()
+        await broadcaster.emit(
+            "system", "❌ 사장님이 자동화 규칙 등록을 거부했습니다.", "[선제적 케어]"
+        )
+        await telegram_client.send_message(
+            "자동화 규칙 등록을 건너뜁니다. 다음에 동일 조건 발생 시 다시 제안드리겠습니다.",
+            user_id=chat_id,
+        )
+        return
+
+    # ── Proactive Care: 키워드 감지 (일반 메시지) ──
+    elif not text.startswith("care_") and not text.startswith("auto_rule_"):
+        care_engine = get_care_engine()
+        care_result = await care_engine.process_message(text)
+        if care_result:
+            tg_msg = care_engine.format_care_telegram_message(care_result["analysis"])
+            await telegram_client.send_message(
+                tg_msg,
+                user_id=chat_id,
+                parse_mode="HTML",
+                reply_markup=care_result["telegram_buttons"],
+            )
+            if care_result["auto_actions"]:
+                event["proactive_care"] = {
+                    "auto_actions": care_result["auto_actions"],
+                    "analysis": care_result["analysis"],
+                }
+            event["proactive_care_context"] = care_result["analysis"]
+
     # 원본 사용자 요청을 전역 컨텍스트에 보관 (Webhook이 발생하면 주입됨)
     _pending_original_context = {
         "source": "telegram",
@@ -192,7 +367,9 @@ async def handle_telegram_message(text: str, chat_id: str):
     # 단, 에이전트가 직접 send_telegram_message 추가 툴을 호출하여 이미 버튼이나 메세지를 보냈다면 중복 발송 생략
     history = result.get("history", [])
     used_tg_tool = any(
-        item.get("type") == "tool" and item.get("name") == "send_telegram_message" 
+        item.get("role") == "tool_call"
+        and isinstance(item.get("content"), dict)
+        and item["content"].get("name") == "send_telegram_message"
         for item in history
     )
     
@@ -233,7 +410,7 @@ class LogBroadcaster:
 
     async def emit(self, log_type: str, content: Any, meta: str = "") -> None:
         entry = {
-            "timestamp": datetime.utcnow().strftime("%H:%M:%S.%f")[:-3],
+            "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3],
             "type": log_type,
             "content": content if isinstance(content, str) else json.dumps(content, ensure_ascii=False, indent=2),
             "meta": meta,
@@ -336,14 +513,16 @@ async def run_agent_loop(trigger_event: dict) -> dict:
     await broadcaster.emit("divider", "PHASE 4 — Webhook 이벤트 처리", "")
 
     _trigger_msg = trigger_event.get("message", "") or ""
-    _email_keywords = {"이메일", "메일", "email", "mail", "smtp", "@gmail", "@naver", "@kakao"}
+    # 이메일 "전송" 의도가 명확한 키워드만 매칭 (단순히 @가 포함된 것은 이메일 의도가 아님)
+    _email_send_keywords = {"이메일 보내", "이메일 전송", "메일 보내", "메일 전송", "email send", "send email", "send mail"}
     _done_keywords  = {"설정완료", "설정 완료", "설정했어", "완료", "입력했어", "비번 설정"}
 
-    _has_email_intent = ("@" in _trigger_msg) or any(kw in _trigger_msg.lower() for kw in _email_keywords)
+    _has_email_intent = any(kw in _trigger_msg.lower() for kw in _email_send_keywords)
     _is_done_trigger  = any(kw in _trigger_msg for kw in _done_keywords)
 
     _pending_email_file  = Path("generated_skills/pending_email_task.json")   # 스킬 실패 시 {to,subj,body}
     _pending_intent_file = Path("generated_skills/pending_intent.json")         # 원본 요청 전체
+    _pending_care_file   = Path("generated_skills/pending_care_task.json")      # 케어 제안 승인 후 중단
 
     # ── (A) 이메일 의도를 가진 원본 요청 저장 ──────────────────────────────
     # "설정완료" 류가 아닌 일반 이메일 요청일 때 원본 메시지를 파일로 보존
@@ -364,10 +543,38 @@ async def run_agent_loop(trigger_event: dict) -> dict:
             pass
 
     # ── (B) 미완료 작업 컨텍스트 주입 ─────────────────────────────────────
-    # 어떤 트리거든 pending 파일이 있으면 에이전트에게 작업 정보를 주입
+    # "설정완료" 등 완료 트리거일 때만 pending 파일을 복구한다.
+    # 일반 메시지(예약 요청 등)에서는 pending을 무시하고 사용자 요청만 처리.
     pending_context = ""
 
-    if _pending_email_file.exists():
+    if _is_done_trigger and _pending_care_file.exists():
+        # 우선순위 0: 케어 제안 승인 후 환경변수 부족으로 중단된 작업 (설정완료 시에만 복구)
+        try:
+            _pc = json.loads(_pending_care_file.read_text(encoding="utf-8"))
+            _care_msg = _pc.get("event_message", "")
+            _care_proposals = _pc.get("proposals", [])
+
+            pending_context = (
+                f"\n\n⚠️ **[선제적 케어 미완료 작업 — 자동 복구]**\n"
+                f"환경변수 부족으로 케어 작업이 중단되었습니다. 사장님이 설정을 완료했으므로 즉시 재개하세요.\n\n"
+                f"== 이전에 승인된 케어 제안 ==\n{_care_msg}\n\n"
+                f"지금 즉시 아래 순서로 작업을 완료하세요:\n"
+                f"1. reload_env 호출하여 새 환경변수 로드\n"
+                f"2. 이전에 중단된 STEP부터 재개 (Priority Ladder 순서 준수)\n"
+                f"3. 모든 STEP 완료 후 결과를 send_telegram_message로 사장님에게 보고\n"
+                f"사용자에게 정보를 다시 요청하지 마세요. 위의 제안 정보에 모든 내용이 있습니다."
+            )
+            # proposals 원본도 이벤트에 추가
+            if _care_proposals:
+                trigger_event["proactive_care_approved_proposals"] = _care_proposals
+
+            await broadcaster.emit("system",
+                f"📌 pending_care_task 복구: 케어 제안 {len(_care_proposals)}개",
+                "[Pending 복구]")
+        except Exception:
+            pending_context = ""
+
+    elif _is_done_trigger and _pending_email_file.exists():
         # 우선순위 1: 스킬 실패 시 저장한 정확한 이메일 파라미터
         try:
             _pe = json.loads(_pending_email_file.read_text(encoding="utf-8"))
@@ -397,8 +604,8 @@ async def run_agent_loop(trigger_event: dict) -> dict:
         except Exception:
             pending_context = ""
 
-    elif _pending_intent_file.exists():
-        # 우선순위 2: 원본 요청 메시지 (스킬이 호출되기 전에 중단된 경우)
+    elif _is_done_trigger and _pending_intent_file.exists():
+        # 우선순위 2: 원본 요청 메시지 (스킬이 호출되기 전에 중단된 경우, 설정완료 시에만 복구)
         try:
             _pi = json.loads(_pending_intent_file.read_text(encoding="utf-8"))
             _orig = _pi.get("original_message", "")
@@ -418,10 +625,64 @@ async def run_agent_loop(trigger_event: dict) -> dict:
         except Exception:
             pending_context = ""
 
+    elif _is_done_trigger:
+        # 우선순위 3: "설정완료/입력했어" 등이지만 pending 파일이 없는 경우
+        # → reload_env 후 이전 작업 확인을 안내
+        pending_context = (
+            f"\n\n⚠️ **[환경변수 설정 완료 알림]**\n"
+            f"사장님이 환경변수(SMTP 비밀번호 등) 설정을 완료했다고 합니다.\n"
+            f"1. 먼저 `reload_env`를 호출하여 새 환경변수를 로드하세요.\n"
+            f"2. 로드 완료 후, 사장님에게 '환경변수가 정상적으로 로드되었습니다. 이전에 중단된 작업이 있으면 다시 요청해 주세요.'라고 안내하세요.\n"
+        )
+
+    # ── Proactive Care 컨텍스트 주입 ──
+    care_context = ""
+    _care_data = trigger_event.get("proactive_care_context")
+    if _care_data:
+        care_context = (
+            f"\n\n🌦️ **[선제적 케어 분석 결과]**\n"
+            f"위험도: {_care_data.get('risk_level', 'unknown').upper()}\n"
+            f"분석: {_care_data.get('analysis', '')}\n"
+            f"제안 수: {len(_care_data.get('proposals', []))}개\n"
+        )
+        _auto = trigger_event.get("proactive_care", {}).get("auto_actions", [])
+        if _auto:
+            care_context += (
+                f"\n⚡ **자동 실행 규칙 {len(_auto)}개 감지** — 즉시 실행하세요:\n"
+                + "\n".join(
+                    f"  - {a['action']}"
+                    + (f" (스킬: {a['skill_name']})" if a.get("skill_name") else "")
+                    for a in _auto
+                )
+                + "\n"
+                "\n**[자동 실행 모드]** 사장님 승인 없이 즉시 위 규칙들을 실행하세요."
+                "\n승인 절차가 이미 자동화되어 있습니다 (3회 이상 승인 이력)."
+                "\n실행 완료 후 send_telegram_message로 사장님에게 **결과만 보고**하세요."
+                "\npropose_care_automation 호출은 불필요합니다 (이미 등록된 규칙).\n"
+            )
+        else:
+            care_context += (
+                "\n케어 제안은 이미 텔레그램으로 사장님에게 전송 완료되었습니다."
+                "\n**텔레그램으로 중복 발송하지 마세요.** 대시보드에 결과만 보고하세요."
+                "\n사장님이 승인하면 해당 액션을 실행하세요.\n"
+            )
+
+    # ── Webhook 루프 전용: 텔레그램 보고 억제 ──
+    _suppress_tg = ""
+    if trigger_event.get("suppress_telegram_report"):
+        _suppress_tg = (
+            "\n\n🚫 **[텔레그램 보고 금지]**\n"
+            "이 루프는 booking_confirmed Webhook에 의한 Site B 동기화 전용입니다.\n"
+            "send_telegram_message를 호출하지 마세요. 사장님에 대한 보고는 원본 텔레그램 루프가 담당합니다.\n"
+            "Site B 날짜 차단(block_site_b_dates)만 수행하고 종료하세요."
+        )
+
     trigger_text = (
         f"다음 이벤트가 발생했습니다. 적절한 조치를 취해주세요.\n\n"
         f"```json\n{json.dumps(trigger_event, ensure_ascii=False, indent=2)}\n```"
         f"{pending_context}"
+        f"{care_context}"
+        f"{_suppress_tg}"
     )
     brain.add_user_message(trigger_text)
     memory.add_event("trigger", trigger_event)
@@ -468,13 +729,11 @@ async def run_agent_loop(trigger_event: dict) -> dict:
                 tool_call_id = tool_call["id"]
 
                 # 역할 라벨 결정
-                if "telco" in tool_name or "auth" in tool_name:
-                    role_label = "[TELCO D]"
-                elif "site_b" in tool_name:
+                if "site_b" in tool_name:
                     role_label = "[SITE B]"
                 elif "site_a" in tool_name:
                     role_label = "[SITE A]"
-                elif "mcp" in tool_name or tool_name in ["camera", "gps", "sms", "phone"]:  # Phone-MCP 도구 감지
+                elif "mcp" in tool_name or tool_name in ["camera", "gps", "sms", "phone"]:
                     role_label = "[PHONE]"
                 else:
                     role_label = "[AGENT C]"
@@ -497,9 +756,10 @@ async def run_agent_loop(trigger_event: dict) -> dict:
                 _is_generated_skill = tool_name not in {
                     "list_all_available_tools", "send_telegram_message",
                     "create_new_skill", "reload_env",
-                    "get_telco_auth_token", "block_site_b_dates",
-                    "block_site_b_dates_with_token", "get_site_a_bookings",
-                    "create_site_a_booking",
+                    "block_site_b_dates", "unblock_site_b_dates",
+                    "get_site_b_availability",
+                    "get_site_a_bookings", "create_site_a_booking",
+                    "register_care_rule", "list_care_rules",
                 }
                 _has_error = isinstance(result, dict) and "error" in result
 
@@ -550,26 +810,6 @@ async def run_agent_loop(trigger_event: dict) -> dict:
                                 updated_schemas = build_function_schemas()
                                 brain.update_tools(updated_schemas)
 
-                # 토큰 발급 시 정책 하이라이트
-                if isinstance(result, dict) and result.get("policy_matched"):
-                    await broadcaster.emit(
-                        "policy",
-                        f"✅ 자동 승인 사유: 사장님 사전 설정 정책 [{result['policy_matched']}] 적용됨",
-                        f"📜 [TELCO D] Policy Check"
-                    )
-                if isinstance(result, dict) and result.get("vpal_session_id"):
-                    await broadcaster.emit(
-                        "vpal",
-                        f"🔒 VPAL 세션 할당: {result['vpal_session_id'][:12]}... (Private Slice 터널 활성화)",
-                        f"🌐 [TELCO D] Network Scan"
-                    )
-                if isinstance(result, dict) and result.get("token"):
-                    await broadcaster.emit(
-                        "signature",
-                        f"✍️ RS256 디지털 서명 토큰 발행 (5분 유효)",
-                        f"🔐 [TELCO D] Signature Issuance"
-                    )
-
                 await broadcaster.emit("tool_result", result_str, f"📋 {role_label} Tool 결과: {tool_name}")
 
                 # 결과를 Brain에 반환
@@ -588,6 +828,34 @@ async def run_agent_loop(trigger_event: dict) -> dict:
                         "[Tool 목록 갱신]"
                     )
 
+                # 스킬 생성 시 env_key_required → pending_email_task 저장 (SMTP 비번 등 환경변수 부족)
+                if tool_name == "create_new_skill" and isinstance(result, dict) and result.get("env_key_required"):
+                    _email_args = tool_args.get("test_args", {})
+                    if _email_args.get("to_email"):
+                        try:
+                            Path("generated_skills/pending_email_task.json").write_text(
+                                json.dumps(_email_args, ensure_ascii=False),
+                                encoding="utf-8"
+                            )
+                            await broadcaster.emit("system",
+                                f"💾 이메일 파라미터 저장 → pending_email_task.json ({_email_args.get('to_email')})",
+                                "[Pending 저장]")
+                        except Exception:
+                            pass
+
+                # 스킬 생성 시 mcp_install_required → pending_care_task에 MCP 설치 정보 추가
+                if tool_name == "create_new_skill" and isinstance(result, dict) and result.get("mcp_install_required"):
+                    _pct = Path("generated_skills/pending_care_task.json")
+                    if _pct.exists():
+                        try:
+                            _pc_data = json.loads(_pct.read_text(encoding="utf-8"))
+                            _pc_data["mcp_install_required"] = True
+                            _pc_data["install_command"] = result.get("install_command", "")
+                            _pc_data["mcp_service"] = result.get("service", "")
+                            _pct.write_text(json.dumps(_pc_data, ensure_ascii=False), encoding="utf-8")
+                        except Exception:
+                            pass
+
                 # 이메일 전송 성공 시 → pending 파일 정리
                 if tool_name == "send_email_via_smtp" and isinstance(result, dict) and result.get("success"):
                     for _pf in [
@@ -597,6 +865,13 @@ async def run_agent_loop(trigger_event: dict) -> dict:
                         if _pf.exists():
                             _pf.unlink()
                     await broadcaster.emit("system", "🗑️ pending 파일 정리 완료 (이메일 전송 성공)", "[Pending 정리]")
+
+                # 케어 규칙 등록 성공 시 → pending_care_task 정리
+                if tool_name == "register_care_rule" and isinstance(result, dict) and result.get("rule_id"):
+                    _pct = Path("generated_skills/pending_care_task.json")
+                    if _pct.exists():
+                        _pct.unlink()
+                        await broadcaster.emit("system", "🗑️ pending_care_task 정리 완료 (케어 규칙 등록 성공)", "[Pending 정리]")
 
 
     else:
@@ -637,14 +912,25 @@ async def chat(request: Request):
         return {"response": "⚠️ 보안 정책에 위반되는 입력이 감지되었습니다. 일반적인 요청을 입력해 주세요."}
 
     logger.info(f"Chat command received: {user_message}")
-    
+
     # 에이전트 루프 실행 (트리거 이벤트를 채팅 메시지로 설정)
     event = {
         "event": "user_command",
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "source": "dashboard_chat",
         "message": user_message
     }
+
+    # ── Proactive Care: 키워드 감지 ──
+    care_engine = get_care_engine()
+    care_result = await care_engine.process_message(user_message)
+    if care_result:
+        event["proactive_care_context"] = care_result["analysis"]
+        if care_result["auto_actions"]:
+            event["proactive_care"] = {
+                "auto_actions": care_result["auto_actions"],
+                "analysis": care_result["analysis"],
+            }
 
     # 원본 사용자 요청을 전역 컨텍스트에 보관
     # → 예약 확정(booking_confirmed) 등의 Webhook이 이 루프 실행 중에 발생하면,
@@ -679,31 +965,31 @@ async def dashboard():
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', monospace;
-            background: #0a0e17;
-            color: #c9d1d9;
+            background: #ffffff;
+            color: #1f2937;
             height: 100vh;
             overflow: hidden;
             display: flex;
             flex-direction: column;
         }
         .header {
-            background: linear-gradient(135deg, #0d1117 0%, #161b22 100%);
-            border-bottom: 1px solid #21262d;
+            background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
+            border-bottom: 1px solid #e2e8f0;
             padding: 1rem 2rem;
             display: flex; align-items: center; justify-content: space-between;
         }
         .header h1 {
             font-size: 1.2rem; font-weight: 600;
-            background: linear-gradient(90deg, #f59e0b, #ef4444, #bc8cff);
+            background: linear-gradient(90deg, #f59e0b, #ef4444, #8b5cf6);
             -webkit-background-clip: text; -webkit-text-fill-color: transparent;
         }
-        .header .status { display: flex; align-items: center; gap: 0.5rem; font-size: 0.8rem; color: #8b949e; }
-        .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #3fb950; animation: pulse 2s ease-in-out infinite; }
+        .header .status { display: flex; align-items: center; gap: 0.5rem; font-size: 0.8rem; color: #64748b; }
+        .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #22c55e; animation: pulse 2s ease-in-out infinite; }
         @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 
         /* ── Network Topology ── */
         .topology {
-            background: #0d1117; border-bottom: 1px solid #21262d;
+            background: #f8fafc; border-bottom: 1px solid #e2e8f0;
             padding: 1rem 2rem; font-size: 0.7rem;
         }
         .topo-container { display: flex; align-items: stretch; gap: 0; max-width: 100%; }
@@ -721,36 +1007,36 @@ async def dashboard():
         }
 
         .zone-public {
-            background: rgba(248,81,73,0.06); border: 1px dashed rgba(248,81,73,0.2);
+            background: rgba(239,68,68,0.05); border: 1px dashed rgba(239,68,68,0.3);
         }
-        .zone-public .zone-label { color: #f85149; }
-        .zone-public .topo-node { background: rgba(248,81,73,0.1); color: #f85149; border: 1px solid rgba(248,81,73,0.2); }
+        .zone-public .zone-label { color: #dc2626; }
+        .zone-public .topo-node { background: rgba(239,68,68,0.08); color: #dc2626; border: 1px solid rgba(239,68,68,0.2); }
 
         .topo-arrow {
-            display: flex; align-items: center; color: #484f58; font-size: 0.65rem;
+            display: flex; align-items: center; color: #94a3b8; font-size: 0.65rem;
             padding: 0 0.4rem; flex-direction: column; gap: 0.15rem;
         }
-        .arrow-line { color: #3fb950; font-weight: 700; font-size: 0.8rem; }
-        .arrow-label { font-size: 0.55rem; color: #8b949e; }
+        .arrow-line { color: #16a34a; font-weight: 700; font-size: 0.8rem; }
+        .arrow-label { font-size: 0.55rem; color: #64748b; }
 
         .zone-private {
-            background: rgba(34,197,94,0.04); border: 1px solid rgba(34,197,94,0.15);
+            background: rgba(22,163,74,0.04); border: 1px solid rgba(22,163,74,0.2);
             flex: 1;
         }
-        .zone-private .zone-label { color: #3fb950; }
-        .zone-private .topo-node { background: rgba(34,197,94,0.08); color: #3fb950; border: 1px solid rgba(34,197,94,0.15); }
+        .zone-private .zone-label { color: #16a34a; }
+        .zone-private .topo-node { background: rgba(22,163,74,0.08); color: #16a34a; border: 1px solid rgba(22,163,74,0.2); }
         .zone-private .inner-row { display: flex; gap: 0.5rem; align-items: center; }
         .topo-vpal {
             display: flex; align-items: center; gap: 0.3rem;
             padding: 0.15rem 0.5rem; border-radius: 10px;
-            background: rgba(56,189,248,0.08); border: 1px solid rgba(56,189,248,0.2);
-            color: #38bdf8; font-size: 0.55rem; font-weight: 600;
+            background: rgba(14,165,233,0.08); border: 1px solid rgba(14,165,233,0.25);
+            color: #0284c7; font-size: 0.55rem; font-weight: 600;
         }
         @keyframes dataFlow {
             0% { opacity: 0.3; } 50% { opacity: 1; } 100% { opacity: 0.3; }
         }
         .flow-dot {
-            width: 4px; height: 4px; border-radius: 50%; background: #3fb950;
+            width: 4px; height: 4px; border-radius: 50%; background: #16a34a;
             animation: dataFlow 1.5s ease-in-out infinite;
         }
         .flow-dot:nth-child(2) { animation-delay: 0.3s; }
@@ -758,51 +1044,58 @@ async def dashboard():
 
         /* ── Main Layout ── */
         .main-content { display: flex; flex: 1; overflow: hidden; position: relative; }
-        .log-panel { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
-        
+        .log-panel { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 200px; }
+
+        /* ── Resizer ── */
+        .panel-resizer {
+            width: 5px; cursor: col-resize; background: #e2e8f0;
+            transition: background 0.2s; flex-shrink: 0;
+        }
+        .panel-resizer:hover, .panel-resizer.active { background: #8b5cf6; }
+
         /* ── Chat Panel ── */
-        .chat-panel { 
-            flex: 1.5; background: #0d1117; display: flex; flex-direction: column; 
-            border-right: 1px solid #21262d; flex-shrink: 0;
+        .chat-panel {
+            width: 420px; min-width: 250px; background: #ffffff; display: flex; flex-direction: column;
+            border-right: 1px solid #e2e8f0; flex-shrink: 0;
         }
         .chat-header {
-            padding: 0.6rem 1.2rem; background: rgba(188, 140, 255, 0.05); 
-            border-bottom: 1px solid #21262d; font-size: 0.8rem; font-weight: 700;
-            color: #bc8cff; display: flex; align-items: center; gap: 0.5rem;
+            padding: 0.6rem 1.2rem; background: rgba(139, 92, 246, 0.04);
+            border-bottom: 1px solid #e2e8f0; font-size: 0.8rem; font-weight: 700;
+            color: #7c3aed; display: flex; align-items: center; gap: 0.5rem;
         }
-        .chat-body { flex: 1; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: 1rem; }
-        .chat-input-area { 
-            padding: 1rem; background: #161b22; border-top: 1px solid #21262d;
+        .chat-body { flex: 1; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: 1rem; background: #fafafa; }
+        .chat-input-area {
+            padding: 1rem; background: #f8fafc; border-top: 1px solid #e2e8f0;
             display: flex; flex-direction: column; gap: 0.6rem;
         }
         .chat-input {
-            width: 100%; background: #0a0e17; border: 1px solid #30363d; border-radius: 6px;
-            padding: 0.6rem 0.8rem; color: #c9d1d9; font-size: 0.8rem; resize: none;
+            width: 100%; background: #ffffff; border: 1px solid #d1d5db; border-radius: 6px;
+            padding: 0.6rem 0.8rem; color: #1f2937; font-size: 0.8rem; resize: none;
             outline: none; transition: border-color 0.2s;
         }
-        .chat-input:focus { border-color: #bc8cff; }
+        .chat-input:focus { border-color: #8b5cf6; }
         .chat-btn {
-            background: #bc8cff; color: #0a0e17; border: none; border-radius: 6px;
+            background: #7c3aed; color: #ffffff; border: none; border-radius: 6px;
             padding: 0.5rem; font-weight: 700; font-size: 0.75rem; cursor: pointer;
             transition: opacity 0.2s, transform 0.1s;
         }
         .chat-btn:hover { opacity: 0.9; }
         .chat-btn:active { transform: scale(0.98); }
-        .chat-msg { 
+        .chat-msg {
             padding: 0.6rem 0.8rem; border-radius: 12px; font-size: 0.75rem; max-width: 85%;
             animation: slideIn 0.3s ease-out;
         }
         @keyframes slideIn { from { opacity: 0; transform: translateX(10px); } to { opacity: 1; transform: translateX(0); } }
-        .msg-user { align-self: flex-end; background: #21262d; color: #c9d1d9; border-bottom-right-radius: 2px; }
-        .msg-agent { align-self: flex-start; background: rgba(188, 140, 255, 0.1); color: #bc8cff; border-bottom-left-radius: 2px; border: 1px solid rgba(188, 140, 255, 0.2); }
+        .msg-user { align-self: flex-end; background: #f1f5f9; color: #1e293b; border-bottom-right-radius: 2px; border: 1px solid #e2e8f0; }
+        .msg-agent { align-self: flex-start; background: rgba(139, 92, 246, 0.08); color: #6d28d9; border-bottom-left-radius: 2px; border: 1px solid rgba(139, 92, 246, 0.2); }
 
         .log-header {
-            padding: 0.5rem 1.5rem; background: #0d1117; border-bottom: 1px solid #21262d;
+            padding: 0.5rem 1.5rem; background: #f8fafc; border-bottom: 1px solid #e2e8f0;
             display: flex; justify-content: space-between; align-items: center;
-            font-size: 0.75rem; color: #8b949e; cursor: pointer; user-select: none;
+            font-size: 0.75rem; color: #64748b; cursor: pointer; user-select: none;
             transition: background 0.2s;
         }
-        .log-header:hover { background: #161b22; }
+        .log-header:hover { background: #f1f5f9; }
         .log-header-title { display: flex; align-items: center; gap: 0.4rem; }
         .toggle-icon { display: inline-block; transition: transform 0.2s; font-size: 0.6rem; }
         .log-container { flex: 1; overflow-y: auto; padding: 0.5rem 1.5rem; }
@@ -814,123 +1107,156 @@ async def dashboard():
             animation: fadeIn 0.3s ease-out; border-left: 3px solid transparent;
         }
         @keyframes fadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; } }
-        .log-entry:hover { background: rgba(255,255,255,0.03); }
-        .log-time { color: #484f58; white-space: nowrap; min-width: 72px; flex-shrink: 0; font-size: 0.7rem; }
+        .log-entry:hover { background: rgba(0,0,0,0.02); }
+        .log-time { color: #94a3b8; white-space: nowrap; min-width: 72px; flex-shrink: 0; font-size: 0.7rem; }
         .log-meta { white-space: nowrap; min-width: 220px; flex-shrink: 0; font-weight: 600; font-size: 0.75rem; }
-        .log-content { flex: 1; white-space: pre-wrap; word-break: break-word; }
+        .log-content { flex: 1; white-space: pre-wrap; word-break: break-word; color: #374151; }
 
         /* Role colors */
-        .log-entry.webhook    { border-left-color: #d29922; } .log-entry.webhook .log-meta { color: #d29922; }
-        .log-entry.system     { border-left-color: #58a6ff; } .log-entry.system .log-meta { color: #58a6ff; }
-        .log-entry.thinking   { border-left-color: #bc8cff; } .log-entry.thinking .log-meta { color: #bc8cff; }
-        .log-entry.reasoning  { border-left-color: #d2a8ff; } .log-entry.reasoning .log-meta { color: #d2a8ff; }
-        .log-entry.tool_call  { border-left-color: #79c0ff; } .log-entry.tool_call .log-meta { color: #79c0ff; }
-        .log-entry.tool_result { border-left-color: #56d364; } .log-entry.tool_result .log-meta { color: #56d364; }
-        .log-entry.complete   { border-left-color: #3fb950; background: rgba(63,185,80,0.08); } .log-entry.complete .log-meta { color: #3fb950; }
-        .log-entry.error      { border-left-color: #f85149; background: rgba(248,81,73,0.08); } .log-entry.error .log-meta { color: #f85149; }
-        .log-entry.loop       { border-left-color: #8b949e; background: rgba(139,148,158,0.03); } .log-entry.loop .log-meta { color: #8b949e; }
-        .log-entry.scene      { border-left-color: #f0883e; background: rgba(240,136,62,0.04); } .log-entry.scene .log-meta { color: #f0883e; } .log-entry.scene .log-content { font-size: 0.7rem; color: #8b949e; }
-        .log-entry.tool_schema { border-left-color: #39d353; background: rgba(57,211,83,0.03); } .log-entry.tool_schema .log-meta { color: #39d353; }
+        .log-entry.webhook    { border-left-color: #d97706; } .log-entry.webhook .log-meta { color: #d97706; }
+        .log-entry.system     { border-left-color: #2563eb; } .log-entry.system .log-meta { color: #2563eb; }
+        .log-entry.thinking   { border-left-color: #7c3aed; } .log-entry.thinking .log-meta { color: #7c3aed; }
+        .log-entry.reasoning  { border-left-color: #8b5cf6; } .log-entry.reasoning .log-meta { color: #8b5cf6; }
+        .log-entry.tool_call  { border-left-color: #0284c7; } .log-entry.tool_call .log-meta { color: #0284c7; }
+        .log-entry.tool_result { border-left-color: #16a34a; } .log-entry.tool_result .log-meta { color: #16a34a; }
+        .log-entry.complete   { border-left-color: #22c55e; background: rgba(34,197,94,0.06); } .log-entry.complete .log-meta { color: #16a34a; }
+        .log-entry.error      { border-left-color: #dc2626; background: rgba(220,38,38,0.05); } .log-entry.error .log-meta { color: #dc2626; }
+        .log-entry.loop       { border-left-color: #94a3b8; background: rgba(148,163,184,0.05); } .log-entry.loop .log-meta { color: #94a3b8; }
+        .log-entry.scene      { border-left-color: #ea580c; background: rgba(234,88,12,0.04); } .log-entry.scene .log-meta { color: #ea580c; } .log-entry.scene .log-content { font-size: 0.7rem; color: #94a3b8; }
+        .log-entry.tool_schema { border-left-color: #16a34a; background: rgba(22,163,74,0.04); } .log-entry.tool_schema .log-meta { color: #16a34a; }
 
         /* Telco highlight events */
         .log-entry.policy {
-            border-left-color: #f59e0b; background: rgba(245,158,11,0.1);
-            border: 1px solid rgba(245,158,11,0.15); border-left: 3px solid #f59e0b;
+            border-left-color: #d97706; background: rgba(217,119,6,0.06);
+            border: 1px solid rgba(217,119,6,0.15); border-left: 3px solid #d97706;
         }
-        .log-entry.policy .log-meta { color: #f59e0b; font-weight: 700; }
-        .log-entry.policy .log-content { color: #fbbf24; font-weight: 600; }
+        .log-entry.policy .log-meta { color: #b45309; font-weight: 700; }
+        .log-entry.policy .log-content { color: #92400e; font-weight: 600; }
 
         .log-entry.vpal {
-            border-left-color: #38bdf8; background: rgba(56,189,248,0.08);
-            border: 1px solid rgba(56,189,248,0.12); border-left: 3px solid #38bdf8;
+            border-left-color: #0284c7; background: rgba(2,132,199,0.05);
+            border: 1px solid rgba(2,132,199,0.12); border-left: 3px solid #0284c7;
         }
-        .log-entry.vpal .log-meta { color: #38bdf8; font-weight: 700; }
-        .log-entry.vpal .log-content { color: #7dd3fc; }
+        .log-entry.vpal .log-meta { color: #0284c7; font-weight: 700; }
+        .log-entry.vpal .log-content { color: #0369a1; }
 
         .log-entry.signature {
-            border-left-color: #a78bfa; background: rgba(167,139,250,0.08);
-            border: 1px solid rgba(167,139,250,0.12); border-left: 3px solid #a78bfa;
+            border-left-color: #7c3aed; background: rgba(124,58,237,0.05);
+            border: 1px solid rgba(124,58,237,0.12); border-left: 3px solid #7c3aed;
         }
-        .log-entry.signature .log-meta { color: #a78bfa; font-weight: 700; }
-        .log-entry.signature .log-content { color: #c4b5fd; }
+        .log-entry.signature .log-meta { color: #7c3aed; font-weight: 700; }
+        .log-entry.signature .log-content { color: #6d28d9; }
 
         .log-entry.divider {
-            border-left: none; border-top: 1px solid #30363d;
+            border-left: none; border-top: 1px solid #e2e8f0;
             margin-top: 0.8rem; margin-bottom: 0.3rem; padding-top: 0.6rem;
         }
         .log-entry.divider .log-meta, .log-entry.divider .log-time { display: none; }
-        .log-entry.divider .log-content { color: #58a6ff; font-weight: 700; font-size: 0.8rem; letter-spacing: 0.05em; }
+        .log-entry.divider .log-content { color: #2563eb; font-weight: 700; font-size: 0.8rem; letter-spacing: 0.05em; }
 
-        .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 60vh; color: #484f58; gap: 1rem; }
+        .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 60vh; color: #94a3b8; gap: 1rem; }
         .empty-state .icon { font-size: 3rem; }
 
         /* ── Skill Library Panel ── */
         .skill-library-panel {
-            background: #0d1117; border-top: 1px solid #21262d;
+            background: #ffffff; border-top: 1px solid #e2e8f0;
         }
         .skill-library-header {
             padding: 0.5rem 1.5rem; font-size: 0.78rem; font-weight: 700;
-            color: #39d353; display: flex; align-items: center; justify-content: space-between;
-            border-bottom: 1px solid #21262d; background: rgba(57,211,83,0.03);
+            color: #16a34a; display: flex; align-items: center; justify-content: space-between;
+            border-bottom: 1px solid #e2e8f0; background: rgba(22,163,74,0.03);
             cursor: pointer; user-select: none; transition: background 0.2s;
         }
-        .skill-library-header:hover { background: rgba(57,211,83,0.06); }
+        .skill-library-header:hover { background: rgba(22,163,74,0.06); }
         .skill-cards {
             display: flex; flex-wrap: wrap; gap: 0.5rem; padding: 0.6rem 1.2rem;
             max-height: 120px; overflow-y: auto;
         }
         .skill-card {
-            background: rgba(57,211,83,0.06); border: 1px solid rgba(57,211,83,0.2);
+            background: rgba(22,163,74,0.05); border: 1px solid rgba(22,163,74,0.2);
             border-radius: 8px; padding: 0.35rem 0.7rem; font-size: 0.7rem;
             display: flex; flex-direction: column; gap: 0.1rem;
             animation: fadeIn 0.4s ease-out; min-width: 140px; max-width: 220px;
         }
-        .skill-card-name { color: #39d353; font-weight: 700; }
-        .skill-card-desc { color: #8b949e; font-size: 0.62rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        .skill-card-service { color: #56d364; font-size: 0.58rem; }
+        .skill-card-name { color: #16a34a; font-weight: 700; }
+        .skill-card-desc { color: #64748b; font-size: 0.62rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .skill-card-service { color: #22c55e; font-size: 0.58rem; }
         .skill-card-delete {
-            background: none; border: none; cursor: pointer; color: #484f58;
+            background: none; border: none; cursor: pointer; color: #94a3b8;
             font-size: 0.7rem; padding: 0; margin-top: 0.1rem; text-align: right;
             transition: color 0.2s;
         }
-        .skill-card-delete:hover { color: #f85149; }
-        .skill-empty { color: #484f58; font-size: 0.72rem; padding: 0.5rem 1.5rem; }
+        .skill-card-delete:hover { color: #dc2626; }
+        .skill-empty { color: #94a3b8; font-size: 0.72rem; padding: 0.5rem 1.5rem; }
+
+        /* ── Active Rules Panel ── */
+        .rules-panel {
+            background: #ffffff; border-top: 1px solid #e2e8f0;
+        }
+        .rules-header {
+            padding: 0.5rem 1.5rem; font-size: 0.78rem; font-weight: 700;
+            color: #d97706; display: flex; align-items: center; justify-content: space-between;
+            border-bottom: 1px solid #e2e8f0; background: rgba(217,119,6,0.03);
+            cursor: pointer; user-select: none; transition: background 0.2s;
+        }
+        .rules-header:hover { background: rgba(217,119,6,0.06); }
+        .rules-cards {
+            display: flex; flex-wrap: wrap; gap: 0.5rem; padding: 0.6rem 1.2rem;
+            max-height: 140px; overflow-y: auto;
+        }
+        .rule-card {
+            background: rgba(217,119,6,0.04); border: 1px solid rgba(217,119,6,0.2);
+            border-radius: 8px; padding: 0.4rem 0.7rem; font-size: 0.7rem;
+            display: flex; flex-direction: column; gap: 0.15rem;
+            animation: fadeIn 0.4s ease-out; min-width: 180px; max-width: 280px;
+        }
+        .rule-card-action { color: #92400e; font-weight: 700; font-size: 0.72rem; }
+        .rule-card-trigger { color: #64748b; font-size: 0.62rem; }
+        .rule-card-meta { color: #94a3b8; font-size: 0.58rem; display: flex; gap: 0.5rem; align-items: center; }
+        .rule-badge-auto { background: rgba(22,163,74,0.12); color: #16a34a; padding: 0.05rem 0.35rem; border-radius: 6px; font-size: 0.55rem; font-weight: 700; }
+        .rule-badge-manual { background: rgba(100,116,139,0.12); color: #64748b; padding: 0.05rem 0.35rem; border-radius: 6px; font-size: 0.55rem; font-weight: 700; }
+        .rule-card-delete {
+            background: none; border: none; cursor: pointer; color: #94a3b8;
+            font-size: 0.7rem; padding: 0; text-align: right; transition: color 0.2s;
+        }
+        .rule-card-delete:hover { color: #dc2626; }
+        .rules-empty { color: #94a3b8; font-size: 0.72rem; padding: 0.5rem 1.5rem; }
 
         /* ── Notary Table ── */
         .notary-panel {
-            background: #0d1117; border-top: 1px solid #21262d;
+            background: #ffffff; border-top: 1px solid #e2e8f0;
             max-height: 200px; overflow-y: auto; padding: 0;
         }
         .notary-header {
             padding: 0.6rem 1.5rem; font-size: 0.8rem; font-weight: 700;
-            color: #f59e0b; display: flex; align-items: center; gap: 0.5rem;
-            border-bottom: 1px solid #21262d; background: rgba(245,158,11,0.03);
+            color: #d97706; display: flex; align-items: center; gap: 0.5rem;
+            border-bottom: 1px solid #e2e8f0; background: rgba(217,119,6,0.03);
             position: sticky; top: 0; z-index: 2;
         }
         .notary-table { width: 100%; border-collapse: collapse; }
         .notary-table th {
             padding: 0.4rem 0.8rem; text-align: left; font-size: 0.65rem;
-            color: #8b949e; text-transform: uppercase; font-weight: 600;
-            border-bottom: 1px solid #21262d; background: #0d1117;
+            color: #64748b; text-transform: uppercase; font-weight: 600;
+            border-bottom: 1px solid #e2e8f0; background: #ffffff;
             position: sticky; top: 34px; z-index: 1;
         }
         .notary-table td {
             padding: 0.35rem 0.8rem; font-size: 0.72rem;
-            border-bottom: 1px solid rgba(33,38,45,0.5);
+            border-bottom: 1px solid #f1f5f9;
         }
-        .notary-table tr:hover { background: rgba(255,255,255,0.02); }
+        .notary-table tr:hover { background: rgba(0,0,0,0.02); }
         .notary-badge {
             padding: 0.1rem 0.4rem; border-radius: 8px; font-size: 0.6rem; font-weight: 600;
         }
-        .badge-issued { background: rgba(34,197,94,0.15); color: #22c55e; }
-        .badge-registered { background: rgba(88,166,255,0.15); color: #58a6ff; }
-        .badge-denied { background: rgba(248,81,73,0.15); color: #f85149; }
-        .badge-isolated { background: rgba(248,81,73,0.2); color: #f85149; }
-        .badge-reactivated { background: rgba(34,197,94,0.2); color: #22c55e; }
+        .badge-issued { background: rgba(34,197,94,0.12); color: #16a34a; }
+        .badge-registered { background: rgba(37,99,235,0.12); color: #2563eb; }
+        .badge-denied { background: rgba(220,38,38,0.12); color: #dc2626; }
+        .badge-isolated { background: rgba(220,38,38,0.15); color: #dc2626; }
+        .badge-reactivated { background: rgba(34,197,94,0.15); color: #16a34a; }
 
         .footer {
-            background: #0d1117; border-top: 1px solid #21262d;
-            padding: 0.4rem 2rem; font-size: 0.65rem; color: #484f58;
+            background: #f8fafc; border-top: 1px solid #e2e8f0;
+            padding: 0.4rem 2rem; font-size: 0.65rem; color: #94a3b8;
             display: flex; justify-content: space-between;
         }
     </style>
@@ -979,7 +1305,7 @@ async def dashboard():
 
     <div class="main-content">
         <!-- Chat Sidebar -->
-        <div class="chat-panel">
+        <div class="chat-panel" id="chatPanel">
             <div class="chat-header">💬 Agent Command Center</div>
             <div class="chat-body" id="chatBody">
                 <div class="chat-msg msg-agent">반갑습니다. 당신의 AI 에이전트 입니다. 어떤 작업을 도와드릴까요?</div>
@@ -987,9 +1313,11 @@ async def dashboard():
             <div class="chat-input-area">
                 <textarea class="chat-input" id="chatInput" placeholder="에이전트에게 명령을 입력하세요... (Shift+Enter로 줄바꿈)" rows="2"></textarea>
                 <button class="chat-btn" onclick="sendChatMessage()">전송 (Enter)</button>
-                <button class="chat-btn" style="background:transparent; border:1px solid #30363d; color:#8b949e; font-size:0.6rem;" onclick="clearLogs()">로그 초기화</button>
+                <button class="chat-btn" style="background:transparent; border:1px solid #d1d5db; color:#64748b; font-size:0.6rem;" onclick="clearLogs()">로그 초기화</button>
             </div>
         </div>
+        <!-- Resizer -->
+        <div class="panel-resizer" id="panelResizer"></div>
         <!-- Log Panel -->
         <div class="log-panel">
             <div class="log-header" onclick="toggleLogPanel()">
@@ -1016,6 +1344,15 @@ async def dashboard():
             <span class="toggle-icon" id="skillToggleIcon" style="font-size:0.6rem;">▶</span>
         </div>
         <div class="skill-cards" id="skillCards" style="display:none;"></div>
+    </div>
+
+    <!-- Active Rules Panel -->
+    <div class="rules-panel" id="rulesPanel">
+        <div class="rules-header" onclick="toggleRulesPanel()">
+            <span>⚡ Active Rules — 자동화 규칙 <span id="rulesCount">0</span>개</span>
+            <span class="toggle-icon" id="rulesToggleIcon" style="font-size:0.6rem;">▶</span>
+        </div>
+        <div class="rules-cards" id="rulesCards" style="display:none;"></div>
     </div>
 
     <!-- Carrier Notary Table -->
@@ -1243,6 +1580,94 @@ async def dashboard():
 
         loadSkills();
         setInterval(loadSkills, 5000);
+
+        // ── Panel Resizer ──
+        (function() {
+            const resizer = document.getElementById('panelResizer');
+            const chatPanel = document.getElementById('chatPanel');
+            let isResizing = false;
+
+            resizer.addEventListener('mousedown', (e) => {
+                isResizing = true;
+                resizer.classList.add('active');
+                document.body.style.cursor = 'col-resize';
+                document.body.style.userSelect = 'none';
+                e.preventDefault();
+            });
+
+            document.addEventListener('mousemove', (e) => {
+                if (!isResizing) return;
+                const newWidth = e.clientX;
+                if (newWidth >= 250 && newWidth <= window.innerWidth - 300) {
+                    chatPanel.style.width = newWidth + 'px';
+                }
+            });
+
+            document.addEventListener('mouseup', () => {
+                if (isResizing) {
+                    isResizing = false;
+                    resizer.classList.remove('active');
+                    document.body.style.cursor = '';
+                    document.body.style.userSelect = '';
+                }
+            });
+        })();
+
+        // ── Active Rules ──
+        function toggleRulesPanel() {
+            const cards = document.getElementById('rulesCards');
+            const icon = document.getElementById('rulesToggleIcon');
+            const isHidden = cards.style.display === 'none';
+            cards.style.display = isHidden ? 'flex' : 'none';
+            icon.textContent = isHidden ? '▼' : '▶';
+            if (isHidden) loadRules();
+        }
+
+        function loadRules() {
+            fetch('/care/rules')
+                .then(r => r.json())
+                .then(data => {
+                    const rules = data.rules || [];
+                    document.getElementById('rulesCount').textContent = rules.length;
+                    const cards = document.getElementById('rulesCards');
+                    if (rules.length === 0) {
+                        cards.innerHTML = '<span class="rules-empty">등록된 자동화 규칙 없음</span>';
+                        return;
+                    }
+                    cards.innerHTML = rules.map(r => {
+                        const badge = r.auto_execute
+                            ? '<span class="rule-badge-auto">AUTO</span>'
+                            : '<span class="rule-badge-manual">MANUAL</span>';
+                        return `<div class="rule-card">
+                            <span class="rule-card-action">${badge} ${escapeHtml(r.action || '')}</span>
+                            <span class="rule-card-trigger">트리거: ${escapeHtml(r.trigger_category || '')} | 승인: ${r.approval_count || 0}회</span>
+                            <span class="rule-card-meta">
+                                ${r.skill_name ? '스킬: ' + escapeHtml(r.skill_name) : ''}
+                            </span>
+                            <button class="rule-card-delete" onclick="deleteRule('${escapeHtml(r.id)}')" title="규칙 삭제">🗑️ 삭제</button>
+                        </div>`;
+                    }).join('');
+                })
+                .catch(() => {});
+        }
+
+        async function deleteRule(ruleId) {
+            if (!confirm('이 자동화 규칙을 삭제하시겠습니까?')) return;
+            try {
+                const resp = await fetch('/care/rules/' + encodeURIComponent(ruleId) + '/delete', { method: 'POST' });
+                const data = await resp.json();
+                if (resp.ok) {
+                    loadRules();
+                } else {
+                    alert('삭제 실패: ' + (data.error || '알 수 없는 오류'));
+                }
+            } catch(e) {
+                alert('통신 오류: ' + e);
+            }
+        }
+
+        loadRules();
+        setInterval(loadRules, 5000);
     </script>
 </body>
 </html>"""
@@ -1285,10 +1710,67 @@ async def clear_logs():
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    """사이트 A의 예약 이벤트를 수신하여 에이전트 루프를 트리거."""
+    """사이트 A의 예약/날씨 이벤트를 수신하여 에이전트 루프를 트리거."""
     try:
         event = await request.json()
         logger.info(f"Webhook received: {json.dumps(event, ensure_ascii=False)}")
+
+        # ── 날씨 변경 Webhook → Proactive Care 트리거 ──
+        if event.get("event") == "weather_changed":
+            weather_info = event.get("weather", {})
+            affected = event.get("affected_bookings", [])
+            new_condition = weather_info.get("current", "")
+            weather_label = weather_info.get("label", new_condition)
+
+            await broadcaster.emit(
+                "webhook",
+                f"🌦️ 날씨 변경 감지: {weather_info.get('previous')} → {new_condition}\n"
+                f"   영향 받는 예약: {len(affected)}건",
+                "🌦️ [SITE A] Weather Webhook"
+            )
+
+            # Proactive Care 분석 (키워드 감지 우회, 직접 weather condition 전달)
+            care_engine = get_care_engine()
+            care_result = await care_engine.process_weather_event(
+                weather_condition=new_condition,
+                weather_label=weather_label,
+                affected_bookings=affected,
+                location=event.get("location", ""),
+                previous_weather=weather_info.get("previous", ""),
+            )
+
+            if care_result:
+                event["proactive_care_context"] = care_result["analysis"]
+
+                if care_result["auto_actions"]:
+                    # ── Auto-execute path: 제안 버튼 없이 즉시 실행 ──
+                    event["proactive_care"] = {
+                        "auto_actions": care_result["auto_actions"],
+                        "analysis": care_result["analysis"],
+                    }
+                    # save_pending_proposals 호출 안함 (버튼 없으므로 불필요)
+                    if telegram_client.token and telegram_client.user_id:
+                        auto_names = "\n".join(
+                            f"  • {a['action']}" for a in care_result["auto_actions"]
+                        )
+                        await telegram_client.send_message(
+                            f"⚡ <b>자동 실행 규칙 감지</b>\n{auto_names}\n\n"
+                            f"자동으로 실행 중입니다. 완료 후 결과를 보고드리겠습니다.",
+                            parse_mode="HTML",
+                        )
+                else:
+                    # ── Manual path: 기존 제안 + 승인 버튼 플로우 ──
+                    save_pending_proposals(care_result["analysis"], affected_bookings=affected)
+                    if telegram_client.token and telegram_client.user_id:
+                        tg_msg = care_engine.format_care_telegram_message(care_result["analysis"])
+                        await telegram_client.send_message(
+                            tg_msg,
+                            parse_mode="HTML",
+                            reply_markup=care_result["telegram_buttons"],
+                        )
+
+            result = await run_agent_loop(event)
+            return JSONResponse(content=result)
 
         # ── 원본 컨텍스트 자동 주입 ──────────────────────────────
         # 사용자 명령(chat/telegram)이 처리 중일 때 Webhook이 도착하면,
@@ -1296,11 +1778,13 @@ async def webhook(request: Request):
         # 이를 통해 "이메일 보내줘" 등의 후속 작업이 컨텍스트 소실 없이 계속된다.
         if _pending_original_context and "original_context" not in event:
             event["original_context"] = _pending_original_context
+            # Webhook agent loop는 Site B 동기화만 수행. 텔레그램 보고는 원본 텔레그램 루프가 담당.
+            event["suppress_telegram_report"] = True
             logger.info(f"Injected original_context into webhook event: {_pending_original_context}")
             await broadcaster.emit(
                 "system",
                 f"🔗 원본 컨텍스트 주입: '{_pending_original_context.get('original_message', '')[:60]}...'\n"
-                f"   → Webhook 루프가 원본 요청을 이어서 처리합니다.",
+                f"   → Webhook 루프가 Site B 동기화만 처리합니다. (텔레그램 보고 생략)",
                 "🔗 Context Bridge"
             )
 
@@ -1541,3 +2025,45 @@ async def get_healing_log():
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+# ── Proactive Care API 엔드포인트 ────────────────────────
+
+@app.get("/care/rules")
+async def get_care_rules():
+    """등록된 Active Rule(자동화 규칙) 전체 목록 조회."""
+    care_engine = get_care_engine()
+    rules = care_engine.get_all_rules()
+    auto_count = sum(1 for r in rules if r.get("auto_execute"))
+    return {
+        "rules": rules,
+        "total": len(rules),
+        "auto_execute_count": auto_count,
+        "manual_count": len(rules) - auto_count,
+    }
+
+
+@app.post("/care/rules/{rule_id}/delete")
+async def delete_care_rule(rule_id: str):
+    """특정 Active Rule 삭제."""
+    care_engine = get_care_engine()
+    if care_engine.delete_rule(rule_id):
+        return {"status": "deleted", "rule_id": rule_id}
+    return JSONResponse(status_code=404, content={"error": f"Rule '{rule_id}' not found"})
+
+
+@app.get("/care/status")
+async def get_care_status():
+    """Proactive Care 상태 조회 (규칙 수, 키워드 카테고리 등)."""
+    care_engine = get_care_engine()
+    rules = care_engine.get_all_rules()
+    from core.proactive_care import _WEATHER_KEYWORDS, _URGENCY_MAP
+    return {
+        "enabled": True,
+        "keyword_categories": {
+            cat: {"keywords": kws, "urgency": _URGENCY_MAP[cat]}
+            for cat, kws in _WEATHER_KEYWORDS.items()
+        },
+        "rules_total": len(rules),
+        "rules_auto_execute": sum(1 for r in rules if r.get("auto_execute")),
+    }

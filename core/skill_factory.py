@@ -30,6 +30,8 @@ import httpx
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
+from core.smithery_client import get_smithery_client
+
 load_dotenv()
 
 logger = logging.getLogger("skill_factory")
@@ -71,7 +73,7 @@ def _get_user_model() -> str:
 # ── API 탐색 ─────────────────────────────────────────────
 
 class APIDiscovery:
-    """웹 검색 기반 API/MCP 서버 탐색기."""
+    """웹 검색 + Smithery API 기반 MCP 서버 탐색기."""
 
     DDGS_ENDPOINT = "https://api.duckduckgo.com/"
     SERPER_ENDPOINT = "https://google.serper.dev/search"
@@ -79,6 +81,7 @@ class APIDiscovery:
     def __init__(self) -> None:
         self.serper_key = os.getenv("SERPER_API_KEY")
         self._client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        self.smithery = get_smithery_client()
 
     async def search(self, query: str) -> list[dict]:
         """검색 실행 (Serper 우선, 없으면 DuckDuckGo)."""
@@ -212,6 +215,26 @@ class APIDiscovery:
         if registry_result:
             return registry_result
 
+        # ── Tier 2 실패 + SMITHERY_API_KEY 미설정 → 사용자에게 설정 안내 ──
+        # MCP가 웹 검색보다 실시간 데이터에 유리하므로, API 키 설정을 우선 권장
+        if not self.smithery.is_available:
+            await _log("system",
+                "🔑 [Smithery API 키 필요] MCP 서버 탐색을 위해 SMITHERY_API_KEY가 필요합니다.\n"
+                "   Smithery는 실시간 데이터(맛집, 날씨, 지도 등)에 특화된 MCP 서버를 제공합니다.\n"
+                "   → https://smithery.ai/account/api-keys 에서 API 키를 발급받으세요.",
+                "[Smithery 설정 필요]")
+            return {
+                "strategy": "unknown",
+                "service_name": "Smithery MCP Registry",
+                "description": (
+                    "실시간 데이터를 위한 MCP 서버를 탐색하려면 SMITHERY_API_KEY가 필요합니다.\n"
+                    "https://smithery.ai/account/api-keys 에서 API 키를 발급받아 .env 파일에 추가해 주세요.\n"
+                    "설정 후 '설정 완료'라고 알려주시면 이어서 작업하겠습니다."
+                ),
+                "env_key_name": "SMITHERY_API_KEY",
+                "auth_required": True,
+            }
+
         # ── Tier 3: REST API / pip / 공공데이터포털 폴백 ──
         all_results = []
 
@@ -252,24 +275,114 @@ class APIDiscovery:
                     f"   인증: {'필요 (' + env_key + ')' if auth_needed else '불필요'}",
                     "[공식 MCP 발견]")
 
+                # ── Step A: Smithery 프록시로 연결 시도 (로컬 설치 불필요) ──
+                if self.smithery.is_available:
+                    await _log("system",
+                        f"🔌 [Tier 1 → Smithery 프록시] {info['server']}를 Smithery 프록시로 연결 시도...",
+                        "[Smithery 프록시 시도]")
+                    try:
+                        # Smithery에서 해당 서버 검색
+                        servers = await self.smithery.search_servers(info["server"])
+                        if servers:
+                            best = servers[0]
+                            details = await self.smithery.get_server_details(best["qualifiedName"])
+                            if details:
+                                mcp_url = details.get("deploymentUrl") or details.get("mcpUrl") or details.get("url", "")
+                                conn_id = await self.smithery.get_or_create_connection(
+                                    best["qualifiedName"],
+                                    server_url=mcp_url
+                                )
+                                if conn_id:
+                                    tools = await self.smithery.list_tools(conn_id)
+                                    await _log("system",
+                                        f"✅ [Smithery 프록시 연결 성공] {info['server']} → 프록시 ID: {conn_id[:16]}...\n"
+                                        f"   사용 가능 도구: {len(tools or [])}개",
+                                        "[Smithery 프록시 성공]")
+                                    return {
+                                        "strategy": "mcp",
+                                        "service_name": info["server"],
+                                        "api_endpoint": f"https://api.smithery.ai/connections/{conn_id}/call",
+                                        "pip_packages": [],
+                                        "auth_required": True,
+                                        "env_key_name": "SMITHERY_API_KEY",
+                                        "description": info["description"],
+                                        "implementation_hint": f"Smithery 프록시를 통해 {info['server']} MCP 서버 호출.",
+                                        "smithery_connection_id": conn_id,
+                                        "smithery_qualified_name": best["qualifiedName"],
+                                        "mcp_tools": tools or details.get("tools", []),
+                                        "mcp_registry_source": f"smithery.ai/server/{best['qualifiedName']}",
+                                        "mcp_reliability": "high",
+                                        "mcp_tier": "official_via_smithery",
+                                    }
+                    except Exception as e:
+                        await _log("system",
+                            f"⚠️ [Smithery 프록시 실패] {e}",
+                            "[Smithery 프록시 실패]")
+
+                # ── Step B: 로컬 MCP 서버 확인 ──
+                local_mcp_url = os.getenv("MCP_SERVER_URL", "http://localhost:8080")
+                if not local_mcp_url.rstrip("/").endswith("/mcp"):
+                    local_mcp_url = local_mcp_url.rstrip("/") + "/mcp"
+                try:
+                    async with httpx.AsyncClient(timeout=3.0) as client:
+                        resp = await client.post(local_mcp_url, json={
+                            "jsonrpc": "2.0", "method": "tools/list", "params": {}, "id": 1
+                        })
+                        if resp.status_code == 200:
+                            tools = resp.json().get("result", {}).get("tools", [])
+                            await _log("system",
+                                f"✅ [로컬 MCP 서버 연결 성공] 도구 {len(tools)}개 발견",
+                                "[로컬 MCP 연결]")
+                            return {
+                                "strategy": "mcp",
+                                "service_name": info["server"],
+                                "api_endpoint": "",
+                                "pip_packages": [],
+                                "auth_required": auth_needed,
+                                "env_key_name": env_key,
+                                "description": info["description"],
+                                "implementation_hint": (
+                                    f"공식 MCP 서버 {info['server']} 사용. "
+                                    f"JSON-RPC tools/list → tools/call 패턴으로 호출."
+                                ),
+                                "mcp_tools": tools,
+                                "mcp_registry_source": info["source"],
+                                "mcp_install_method": info["install"],
+                                "mcp_reliability": "high",
+                                "mcp_tier": "official",
+                            }
+                except Exception:
+                    pass  # 로컬 MCP 서버 없음 → Step C로
+
+                # ── Step C: MCP 서버 설치 안내 ──
+                # Smithery도 안 되고, 로컬에도 없으면 → 사용자에게 설치 유도
+                install_cmd = info["install"]
+                env_hint = f"\n   환경변수: {env_key}" if auth_needed else ""
+
+                await _log("system",
+                    f"📦 [MCP 서버 미설치] {info['server']}가 로컬에 없습니다.\n"
+                    f"   설치 명령어: {install_cmd}{env_hint}\n"
+                    f"   → 사장님에게 설치 안내를 전달합니다.",
+                    "[MCP 설치 필요]")
+
                 return {
-                    "strategy": "mcp",
+                    "strategy": "mcp_install_required",
                     "service_name": info["server"],
-                    "api_endpoint": "",
-                    "pip_packages": [],
-                    "auth_required": auth_needed,
-                    "env_key_name": env_key,
                     "description": info["description"],
-                    "implementation_hint": (
-                        f"공식 MCP 서버 {info['server']} 사용. "
-                        f"설치: {info['install']}. "
-                        f"JSON-RPC tools/list → tools/call 패턴으로 호출."
-                    ),
-                    "mcp_registry_source": info["source"],
-                    "mcp_install_method": info["install"],
-                    "mcp_tool_schema": None,
-                    "mcp_reliability": "high",  # 공식 서버 = 최고 신뢰도
+                    "install_command": install_cmd,
+                    "env_key_name": env_key,
+                    "auth_required": auth_needed,
+                    "source": info["source"],
                     "mcp_tier": "official",
+                    "install_guide": (
+                        f"📦 **MCP 서버 설치가 필요합니다**\n\n"
+                        f"서버: {info['server']}\n"
+                        f"설명: {info['description']}\n\n"
+                        f"**설치 방법:**\n"
+                        f"```\n{install_cmd}\n```\n"
+                        + (f"\n**환경변수 설정:**\n`.env` 파일에 `{env_key}=발급받은키` 추가\n" if auth_needed else "")
+                        + f"\n설치 후 '설정 완료'라고 알려주세요."
+                    ),
                 }
 
         return None
@@ -278,32 +391,128 @@ class APIDiscovery:
 
     async def _search_mcp_registries(self, user_request: str) -> dict | None:
         """
-        Smithery.ai / Awesome-MCP에서 커뮤니티 MCP 서버를 탐색.
-        공식 서버에 없는 특화 기능(예: 특정 워크플로우 최적화)을 찾을 때 사용.
+        Smithery REST API로 MCP 서버를 시맨틱 검색 → 매니지드 프록시 연결.
+        API 키 미설정 시 기존 웹 검색 폴백.
         """
         await _log("system",
-            "📚 [Tier 2] MCP 레지스트리 심층 탐색: Smithery.ai / Awesome-MCP",
+            "📚 [Tier 2] MCP 레지스트리 탐색 시작",
             "[MCP 레지스트리]")
 
+        # ── STEP 1: Smithery REST API 직접 연동 (우선) ──
+        if self.smithery.is_available:
+            await _log("system",
+                "🏪 [Smithery API] 시맨틱 검색 시작...",
+                "[Smithery 탐색 중...]")
+
+            servers = await self.smithery.search_servers(user_request)
+            if servers:
+                # 검색 결과 로그
+                server_list = "\n".join(
+                    f"  - {s.get('qualifiedName', '?')}: {s.get('description', '')[:80]}"
+                    f" (사용: {s.get('useCount', 0)}회, 검증: {'✅' if s.get('verified') else '❌'})"
+                    for s in servers[:5]
+                )
+                await _log("system",
+                    f"🔍 [Smithery] {len(servers)}개 서버 발견:\n{server_list}",
+                    "[Smithery 검색 결과]")
+
+                # 최적 서버 선택 (시맨틱 검색 상위 = 가장 적합)
+                best = servers[0]
+                qualified_name = best.get("qualifiedName", "")
+
+                # 상세 정보 조회 (도구 목록 포함)
+                details = await self.smithery.get_server_details(qualified_name)
+                if details:
+                    display_name = details.get("displayName", qualified_name)
+                    tools_from_details = details.get("tools", [])
+
+                    await _log("system",
+                        f"📋 [Smithery] 서버 상세: {display_name}\n"
+                        f"   도구 수: {len(tools_from_details)}개\n"
+                        f"   설명: {details.get('description', '')[:120]}",
+                        "[Smithery 서버 상세]")
+
+                    # 프록시 연결 생성
+                    deployment_url = details.get("deploymentUrl") or details.get("mcpUrl") or details.get("url", "")
+                    conn_id = await self.smithery.get_or_create_connection(
+                        qualified_name, server_url=deployment_url
+                    )
+
+                    if conn_id:
+                        # 연결 성공 → 실제 tools/list로 라이브 도구 확인
+                        live_tools = await self.smithery.list_tools(conn_id)
+                        final_tools = live_tools if live_tools else tools_from_details
+
+                        tools_desc = "\n".join(
+                            f"  - {t.get('name', '?')}: {t.get('description', '')[:60]}"
+                            for t in final_tools[:10]
+                        )
+                        await _log("system",
+                            f"✅ [Smithery] 프록시 연결 완료: {qualified_name}\n"
+                            f"   연결 ID: {conn_id}\n"
+                            f"   사용 가능 도구:\n{tools_desc}",
+                            "[Smithery 연결 완료]")
+
+                        return {
+                            "strategy": "mcp",
+                            "service_name": display_name,
+                            "api_endpoint": f"{self.smithery.BASE_URL}/connections/{conn_id}/call",
+                            "pip_packages": [],
+                            "auth_required": True,
+                            "env_key_name": "SMITHERY_API_KEY",
+                            "description": details.get("description", ""),
+                            "implementation_hint": (
+                                f"Smithery 프록시를 통해 MCP 도구 호출. "
+                                f"연결 ID: {conn_id}. "
+                                f"도구 목록: {[t.get('name') for t in final_tools[:5]]}"
+                            ),
+                            "mcp_registry_source": f"smithery.ai/server/{qualified_name}",
+                            "mcp_install_method": "smithery_proxy",
+                            "mcp_tool_schema": final_tools[0] if final_tools else None,
+                            "mcp_tools": final_tools,
+                            "mcp_reliability": "high" if best.get("verified") else "medium",
+                            "mcp_tier": "community",
+                            "smithery_connection_id": conn_id,
+                            "smithery_qualified_name": qualified_name,
+                        }
+                    else:
+                        await _log("system",
+                            f"⚠️ [Smithery] 프록시 연결 실패: {qualified_name} → 웹 검색 폴백",
+                            "[Smithery 연결 실패]")
+                else:
+                    await _log("system",
+                        f"⚠️ [Smithery] 서버 상세 조회 실패: {qualified_name} → 웹 검색 폴백",
+                        "[Smithery 상세 실패]")
+            else:
+                await _log("system",
+                    "ℹ️ [Smithery] 검색 결과 없음 → 웹 검색 폴백",
+                    "[Smithery 미발견]")
+        else:
+            await _log("system",
+                "ℹ️ SMITHERY_API_KEY 미설정 → Smithery 탐색 불가",
+                "[Smithery 비활성]")
+            # API 키 미설정 시 웹 검색 폴백 없이 즉시 반환
+            # → discover_strategy()에서 사용자에게 SMITHERY_API_KEY 설정 안내
+            return None
+
+        # ── STEP 2: 웹 검색 폴백 (Smithery API 사용 가능하지만 검색/연결 실패 시) ──
         registry_results = []
 
-        # Smithery.ai 탐색
         smithery_queries = [
             f"site:smithery.ai {user_request}",
             f"smithery.ai MCP server {user_request}",
         ]
         for q in smithery_queries:
-            await _log("system", f"🏪 검색: {q}", "[Smithery 탐색 중...]")
+            await _log("system", f"🏪 웹 검색 폴백: {q}", "[Smithery 웹 검색...]")
             results = await self.search(q)
             registry_results.extend(results)
 
-        # Awesome-MCP (GitHub) 탐색
         awesome_queries = [
             f"github awesome-mcp-servers {user_request}",
             f"github punkpeye awesome-mcp {user_request}",
         ]
         for q in awesome_queries:
-            await _log("system", f"📦 검색: {q}", "[Awesome-MCP 탐색 중...]")
+            await _log("system", f"📦 웹 검색 폴백: {q}", "[Awesome-MCP 웹 검색...]")
             results = await self.search(q)
             registry_results.extend(results)
 
@@ -313,13 +522,12 @@ class APIDiscovery:
                 "[레지스트리 미발견]")
             return None
 
-        # LLM이 레지스트리 결과를 분석하여 적합한 MCP 서버 판단
         analysis = await self._analyze_mcp_registry(user_request, registry_results)
         if analysis and analysis.get("found"):
             mcp_source = analysis.get("source", "unknown")
             mcp_name = analysis.get("mcp_server_name", "Unknown MCP")
             await _log("system",
-                f"✅ [Tier 2] MCP 서버 발견: {mcp_name}\n"
+                f"✅ [Tier 2] MCP 서버 발견 (웹 검색): {mcp_name}\n"
                 f"   출처: {mcp_source}\n"
                 f"   설치: {analysis.get('install_method', 'N/A')}\n"
                 f"   신뢰도: {analysis.get('reliability', 'N/A')}",
@@ -603,9 +811,62 @@ class CodeSynthesizer:
         if strategy.get("strategy") != "mcp":
             return ""
 
-        # Case 1: 로컬 MCP 서버 — 실제 도구 목록이 있는 경우
         mcp_tools = strategy.get("mcp_tools")
-        if mcp_tools:
+        connection_id = strategy.get("smithery_connection_id")
+
+        # Case 1: Smithery 프록시 연결 — 도구 목록 + 프록시 호출 패턴
+        if connection_id and mcp_tools:
+            tools_text = json.dumps(mcp_tools, ensure_ascii=False, indent=2)
+            return f"""
+## Smithery MCP 프록시 (CRITICAL — 이 패턴을 반드시 사용하라)
+
+이 MCP 서버는 Smithery 매니지드 프록시를 통해 호출한다.
+로컬 설치 불필요. 아래 도구 목록에 있는 도구만 사용하라.
+
+### 사용 가능한 도구 목록
+```json
+{tools_text}
+```
+
+### Smithery 프록시 호출 패턴 (반드시 이 패턴을 따르라)
+```python
+import httpx, os
+
+SMITHERY_API_KEY = os.getenv("SMITHERY_API_KEY")
+SMITHERY_PROXY_URL = "https://api.smithery.ai/connections/{connection_id}/call"
+
+async with httpx.AsyncClient(timeout=15.0) as client:
+    resp = await client.post(
+        SMITHERY_PROXY_URL,
+        headers={{"Authorization": f"Bearer {{SMITHERY_API_KEY}}"}},
+        json={{
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {{"name": "도구명", "arguments": {{"key": "value"}}}},
+            "id": 1
+        }}
+    )
+    if resp.status_code != 200:
+        return {{"error": "Smithery 프록시 호출 실패", "detail": f"HTTP {{resp.status_code}}"}}
+
+    data = resp.json()
+    if "error" in data:
+        return {{"error": "MCP 오류", "detail": str(data["error"])}}
+
+    content_list = data.get("result", {{}}).get("content", [])
+    texts = [c.get("text", "") for c in content_list if c.get("type") == "text"]
+    return {{"결과": "\\n".join(texts) if texts else str(data.get("result", ""))}}
+```
+
+### 핵심 규칙
+1. **SMITHERY_API_KEY**를 반드시 `os.getenv()`로 읽어라 (하드코딩 금지)
+2. **도구 목록의 `name`과 `inputSchema.properties`를 정확히** 사용하라
+3. 모든 검색 파라미터(지명, 카테고리 등)는 **함수 파라미터로** 받아라
+4. **결과는 result.content[].text에서 추출** — MCP 표준 응답 형식
+"""
+
+        # Case 2: 로컬 MCP 서버 — 실제 도구 목록이 있는 경우
+        if mcp_tools and not connection_id:
             tools_text = json.dumps(mcp_tools, ensure_ascii=False, indent=2)
             return f"""
 ## 로컬 MCP 서버 실제 도구 목록 (CRITICAL — 이 정보를 반드시 사용하라)
@@ -619,7 +880,7 @@ class CodeSynthesizer:
 이 도구들의 `name`과 `inputSchema.properties`를 정확히 사용하여 `tools/call`을 호출하라.
 """
 
-        # Case 2: 외부 MCP 레지스트리 발견 — 범용 래퍼 스킬 생성
+        # Case 3: 외부 MCP 레지스트리 발견 (프록시 연결 없음) — 범용 래퍼 스킬 생성
         registry_source = strategy.get("mcp_registry_source", "")
         tool_schema = strategy.get("mcp_tool_schema")
         install_method = strategy.get("mcp_install_method", "")
@@ -627,12 +888,10 @@ class CodeSynthesizer:
         if registry_source:
             schema_text = json.dumps(tool_schema, ensure_ascii=False, indent=2) if tool_schema else "스키마 미상"
             return f"""
-## 외부 MCP 레지스트리에서 발견된 서버 (CRITICAL — 범용 래퍼 스킬로 작성하라)
+## 외부 MCP 레지스트리에서 발견된 서버 (범용 래퍼 스킬로 작성하라)
 
-이 MCP 서버는 외부 레지스트리({registry_source})에서 발견되었으며,
-아직 로컬에 설치되지 않았다. 따라서 **직접 JSON-RPC를 호출하는 것이 아니라**,
-먼저 `tools/list`로 사용 가능한 도구를 확인하고, 적합한 도구를 `tools/call`로 호출하는
-**범용 래퍼 스킬(Universal Wrapper Skill)** 패턴으로 작성하라.
+이 MCP 서버는 외부 레지스트리({registry_source})에서 발견되었다.
+`tools/list`로 도구를 확인하고 `tools/call`로 호출하는 범용 래퍼 스킬을 작성하라.
 
 ### 발견된 MCP 서버 정보
 - 서버: {strategy.get('service_name', 'Unknown')}
@@ -640,60 +899,25 @@ class CodeSynthesizer:
 - 설치: {install_method}
 - 도구 스키마 (참고용): {schema_text}
 
-### 범용 래퍼 스킬 구현 패턴 (반드시 이 패턴을 따르라)
+### 구현 패턴
 ```python
-@tool
-async def skill_name(param1: str, param2: str = "") -> dict:
-    \"\"\"설명\"\"\"
-    mcp_url = os.getenv("MCP_SERVER_URL", "http://localhost:8080")
-    if not mcp_url.rstrip("/").endswith("/mcp"):
-        mcp_url = mcp_url.rstrip("/") + "/mcp"
+mcp_url = os.getenv("MCP_SERVER_URL", "http://localhost:8080")
+if not mcp_url.rstrip("/").endswith("/mcp"):
+    mcp_url = mcp_url.rstrip("/") + "/mcp"
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        # 1단계: 도구 목록 조회
-        list_resp = await client.post(mcp_url, json={{
-            "jsonrpc": "2.0", "method": "tools/list", "params": {{}}, "id": 1
-        }})
-        if list_resp.status_code != 200:
-            return {{"error": "MCP 서버 연결 실패", "detail": f"HTTP {{list_resp.status_code}}"}}
-
-        tools = list_resp.json().get("result", {{}}).get("tools", [])
-        # 적합한 도구 이름을 찾는다 (스키마 참고)
-        target_tool = None
-        for t in tools:
-            if "키워드" in t.get("description", "").lower() or t["name"] == "예상_도구명":
-                target_tool = t["name"]
-                break
-        if not target_tool and tools:
-            target_tool = tools[0]["name"]  # 폴백: 첫 번째 도구
-        if not target_tool:
-            return {{"error": "MCP 서버에 사용 가능한 도구 없음"}}
-
-        # 2단계: 도구 실행
-        call_resp = await client.post(mcp_url, json={{
-            "jsonrpc": "2.0",
-            "method": "tools/call",
-            "params": {{"name": target_tool, "arguments": {{"param1": param1}}}},
-            "id": 2
-        }})
-        if call_resp.status_code != 200:
-            return {{"error": "MCP 도구 실행 실패", "detail": f"HTTP {{call_resp.status_code}}"}}
-
-        data = call_resp.json()
-        if "error" in data:
-            return {{"error": "MCP 오류", "detail": str(data["error"])}}
-
-        # 3단계: 결과 추출
-        content_list = data.get("result", {{}}).get("content", [])
-        texts = [c.get("text", "") for c in content_list if c.get("type") == "text"]
-        return {{"결과": "\\n".join(texts) if texts else str(data.get("result", ""))}}
+async with httpx.AsyncClient(timeout=15.0) as client:
+    list_resp = await client.post(mcp_url, json={{
+        "jsonrpc": "2.0", "method": "tools/list", "params": {{}}, "id": 1
+    }})
+    tools = list_resp.json().get("result", {{}}).get("tools", [])
+    # 도구 이름을 동적으로 탐색하여 호출
 ```
 
 ### 핵심 규칙
-1. **모든 변수를 함수 파라미터로** — 특정 지명/수치를 하드코딩하지 마라
-2. **tools/list로 동적 탐색** — 도구 이름을 하드코딩하지 말고 목록에서 검색하라
-3. **Fallback 필수** — MCP 서버 미연결, 도구 없음, 타임아웃 모두 에러 dict로 반환
-4. **결과는 result.content[].text에서 추출** — MCP 표준 응답 형식
+1. 모든 변수를 함수 파라미터로 — 하드코딩 금지
+2. tools/list로 동적 탐색 — 도구 이름을 하드코딩하지 말 것
+3. Fallback 필수 — 에러 dict 반환
+4. 결과는 result.content[].text에서 추출
 """
         return ""
 
@@ -1338,7 +1562,36 @@ class SkillFactory:
         await _log("divider", "PHASE 1 — 탐색 및 전략 수립", "")
         strategy = await self.discovery.discover_strategy(user_request)
 
+        if strategy.get("strategy") == "mcp_install_required":
+            # MCP 서버가 발견되었으나 로컬에 미설치 + Smithery 프록시도 불가
+            install_guide = strategy.get("install_guide", "")
+            return {
+                "success": False,
+                "mcp_install_required": True,
+                "service": strategy.get("service_name"),
+                "install_command": strategy.get("install_command"),
+                "env_key_name": strategy.get("env_key_name"),
+                "message": install_guide,
+            }
+
         if strategy.get("strategy") == "unknown":
+            # env_key_name이 있으면 → 사용자에게 API 키 설정 안내 (Smithery 등)
+            env_key = strategy.get("env_key_name")
+            if env_key and not os.getenv(env_key):
+                await _log("system",
+                    f"🔑 '{env_key}' 환경변수가 필요합니다.",
+                    "[.env 설정 요청]")
+                return {
+                    "success": False,
+                    "env_key_required": env_key,
+                    "service": strategy.get("service_name"),
+                    "message": (
+                        f"🔑 **API 키 설정 필요**: `{env_key}`\n\n"
+                        f"{strategy.get('description', '')}\n\n"
+                        f"`.env` 파일에 `{env_key}=발급받은키` 를 추가한 후\n"
+                        f"`reload_env`를 호출하거나 '설정 완료'라고 알려주세요."
+                    ),
+                }
             return {
                 "success": False,
                 "message": f"❌ 적합한 API/서비스를 찾지 못했습니다: {strategy.get('description')}",

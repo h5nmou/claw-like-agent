@@ -234,18 +234,27 @@ class SkillRegistry:
     # ── 스킬 삭제 ─────────────────────────────────────────────
 
     def delete_skill(self, skill_name: str) -> dict:
-        """스킬을 완전히 삭제."""
+        """스킬과 모든 부산물(버전 폴더, 품질 로그 등)을 완전히 삭제."""
+        import shutil
         from core.executor import _TOOL_REGISTRY
 
         skill_file = GENERATED_SKILLS_DIR / f"{skill_name}.py"
         results = []
 
+        # 1. 스킬 소스 파일 삭제
         if skill_file.exists():
             skill_file.unlink()
             results.append(f"✅ 파일 삭제: generated_skills/{skill_name}.py")
         else:
             results.append(f"⚠️ 파일 없음: generated_skills/{skill_name}.py")
 
+        # 2. 버전 폴더 삭제 (generated_skills/{skill_name}/)
+        skill_dir = GENERATED_SKILLS_DIR / skill_name
+        if skill_dir.exists() and skill_dir.is_dir():
+            shutil.rmtree(skill_dir)
+            results.append(f"✅ 버전 폴더 삭제: generated_skills/{skill_name}/")
+
+        # 3. Tool 레지스트리에서 제거
         if skill_name in _TOOL_REGISTRY:
             del _TOOL_REGISTRY[skill_name]
             results.append(f"✅ Tool 레지스트리에서 제거: {skill_name}")
@@ -258,6 +267,18 @@ class SkillRegistry:
         if skill_name in self._metadata_cache:
             del self._metadata_cache[skill_name]
 
+        # 4. 품질 로그에서 해당 스킬 기록 제거
+        try:
+            from core.skill_quality import get_quality_evaluator
+            evaluator = get_quality_evaluator()
+            if skill_name in evaluator._records:
+                del evaluator._records[skill_name]
+                evaluator._save_log()
+                results.append(f"✅ 품질 로그에서 제거: {skill_name}")
+        except Exception:
+            pass
+
+        # 5. 인덱스 업데이트
         self._ensure_index()
         before_count = len(self._index.get("skills", []))
         self._index["skills"] = [
@@ -267,6 +288,18 @@ class SkillRegistry:
         after_count = len(self._index["skills"])
         self._index["total_count"] = after_count
         self._index["last_updated"] = datetime.now().isoformat()
+
+        # 6. categories에서도 해당 스킬 제거, 빈 카테고리는 삭제
+        categories = self._index.get("categories", {})
+        empty_cats = []
+        for cat_name, cat_data in categories.items():
+            if isinstance(cat_data, dict) and "skills" in cat_data:
+                cat_data["skills"] = [s for s in cat_data["skills"] if s != skill_name]
+                if not cat_data["skills"]:
+                    empty_cats.append(cat_name)
+        for cat_name in empty_cats:
+            del categories[cat_name]
+
         self._save_index()
 
         if before_count > after_count:

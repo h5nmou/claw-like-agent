@@ -1,8 +1,7 @@
 """
-site_b.py — Mock 예약 사이트 B (Guardian Agent)
+site_b.py — Mock 예약 사이트 B (동기화 대상)
 
 날짜별 가용 상태를 조회·변경할 수 있는 가상 사이트.
-PATCH 엔드포인트는 Telco RS256 JWT 인증 필수.
 Port: 8002
 """
 
@@ -11,73 +10,16 @@ from __future__ import annotations
 import logging
 from datetime import date, timedelta
 
-import httpx
-import jwt
-from cryptography.hazmat.primitives.serialization import load_pem_public_key
-from fastapi import FastAPI, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, Query
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("site_b")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
-app = FastAPI(title="Mock Site B - Guardian Agent", version="0.2.0")
-
-# ── Telco Public Key (부팅 시 가져옴) ────────────────
-
-_telco_public_key = None
-
-
-async def _ensure_telco_key():
-    """Telco Public Key가 없으면 가져오기를 시도."""
-    global _telco_public_key
-    if _telco_public_key is not None:
-        return True
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get("http://localhost:8003/public-key", timeout=3.0)
-            if resp.status_code == 200:
-                pem = resp.json()["telco_public_key"]
-                _telco_public_key = load_pem_public_key(pem.encode("utf-8"))
-                logger.info("Telco Public Key 로드 완료 (RS256 검증 활성화)")
-                return True
-    except Exception as e:
-        logger.warning(f"Telco Public Key 로드 실패: {e}")
-    return False
-
-
-async def verify_token(request: Request) -> dict | None:
-    """Authorization 헤더에서 JWT RS256 검증 + VPAL 세션 이중 검증."""
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
-        return None
-    token = auth_header[7:]
-
-    # Lazy loading: 키가 없으면 지금 가져오기 시도
-    if _telco_public_key is None:
-        loaded = await _ensure_telco_key()
-        if not loaded:
-            logger.warning("Telco Public Key 없음 — 인증 불가")
-            return None
-
-    try:
-        payload = jwt.decode(token, _telco_public_key, algorithms=["RS256"])
-    except jwt.ExpiredSignatureError:
-        logger.warning("Token expired")
-        return None
-    except jwt.InvalidTokenError as e:
-        logger.warning(f"Invalid token: {e}")
-        return None
-
-    # VPAL 세션 이중 검증
-    vpal_header = request.headers.get("X-VPAL-Session", "")
-    vpal_in_token = payload.get("vpal_session_id", "")
-    if vpal_in_token and vpal_header != vpal_in_token:
-        logger.warning(f"VPAL 세션 불일치: header={vpal_header}, token={vpal_in_token}")
-        return None
-
-    logger.info(f"VPAL 검증 통과: session={vpal_header[:8]}...")
-    return payload
+app = FastAPI(title="Mock Site B - 동기화 대상", version="0.3.0")
 
 
 # ── 데이터 모델 ──────────────────────────────────────
@@ -125,8 +67,6 @@ def _date_range(check_in: str, check_out: str) -> list[str]:
 @app.get("/", response_class=HTMLResponse)
 async def index():
     today = date.today()
-    auth_status = "RS256 활성" if _telco_public_key else "대기 중 (Telco 미연결)"
-    auth_color = "#22c55e" if _telco_public_key else "#f59e0b"
     cards = ""
 
     for room_id, room_name in ROOMS.items():
@@ -156,7 +96,7 @@ async def index():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Site B — Guardian Agent</title>
+    <title>Site B — 동기화 대상</title>
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{
@@ -181,22 +121,13 @@ async def index():
             border-radius: 12px; padding: 1.5rem; margin-bottom: 1rem;
         }}
         .card h2 {{ font-size: 1rem; color: #cbd5e1; margin-bottom: 0.5rem; }}
-        .badge {{
-            display: inline-flex; align-items: center; gap: 0.3rem;
-            padding: 0.2rem 0.6rem; border-radius: 12px; font-size: 0.7rem; font-weight: 600;
-        }}
     </style>
     <meta http-equiv="refresh" content="5">
 </head>
 <body>
     <div class="container">
-        <h1>📅 Site B — Guardian Agent</h1>
-        <p class="subtitle">
-            Mock 동기화 대상 사이트 · 5초 새로고침 ·
-            <span class="badge" style="background:rgba({','.join(['34,197,94' if _telco_public_key else '245,158,11'])},0.15);color:{auth_color};border:1px solid {auth_color}40;">
-                🔒 {auth_status}
-            </span>
-        </p>
+        <h1>📅 Site B — 동기화 대상</h1>
+        <p class="subtitle">Mock 동기화 대상 사이트 · 5초 새로고침</p>
         <div class="legend">
             <div class="legend-item"><div class="legend-dot" style="background:#22c55e;"></div>예약 가능</div>
             <div class="legend-item"><div class="legend-dot" style="background:#ef4444;"></div>예약 불가 (차단됨)</div>
@@ -210,7 +141,7 @@ async def index():
 
 @app.get("/rooms/{room_id}/availability")
 async def get_availability(room_id: str, check_in: str = Query(None), check_out: str = Query(None)):
-    """가용 상태 조회 — 인증 불필요."""
+    """가용 상태 조회."""
     if room_id not in availability:
         return {"error": f"Unknown room: {room_id}"}
     room_avail = availability[room_id]
@@ -223,22 +154,8 @@ async def get_availability(room_id: str, check_in: str = Query(None), check_out:
 
 
 @app.patch("/rooms/{room_id}/availability")
-async def update_availability(room_id: str, req: AvailabilityUpdate, request: Request):
-    """가용 상태 변경 — Telco RS256 JWT 인증 필수."""
-    payload = await verify_token(request)
-    if payload is None:
-        logger.warning(f"Unauthorized PATCH attempt for {room_id}")
-        return JSONResponse(
-            status_code=401,
-            content={
-                "error": "Unauthorized",
-                "required": "Telco-Auth-Token",
-                "message": "Telco Trust Server에서 RS256 서명된 JWT가 필요합니다.",
-            },
-        )
-
-    logger.info(f"Authenticated: agent={payload.get('agent_id')}, policy={payload.get('policy')}, owner={payload.get('owner')}")
-
+async def update_availability(room_id: str, req: AvailabilityUpdate):
+    """가용 상태 변경."""
     if room_id not in availability:
         return {"error": f"Unknown room: {room_id}"}
 
@@ -255,6 +172,4 @@ async def update_availability(room_id: str, req: AvailabilityUpdate, request: Re
         "room_id": room_id,
         "updated_dates": updated,
         "available": req.available,
-        "authenticated_by": payload.get("agent_id"),
-        "policy": payload.get("policy"),
     }

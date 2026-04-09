@@ -397,11 +397,52 @@ class SkillQualityEvaluator:
             if len(history) > 500:
                 history = history[-500:]
 
-            QUALITY_LOG_PATH.write_text(
-                json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
+            self._write_or_delete_log(history)
         except Exception as e:
             logger.warning(f"품질 로그 저장 실패: {e}")
+
+    @staticmethod
+    def _write_or_delete_log(history: list[dict]) -> None:
+        """로그가 비어있으면 파일 삭제, 아니면 저장."""
+        if not history:
+            if QUALITY_LOG_PATH.exists():
+                QUALITY_LOG_PATH.unlink()
+                logger.info("quality_log.json 삭제 (로그 0건)")
+            return
+        QUALITY_LOG_PATH.write_text(
+            json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    def cleanup_stale_entries(self) -> int:
+        """존재하지 않는 스킬의 로그를 정리하고, 비어있으면 파일 삭제.
+
+        Returns:
+            제거된 항목 수
+        """
+        if not QUALITY_LOG_PATH.exists():
+            return 0
+        try:
+            history = json.loads(QUALITY_LOG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return 0
+
+        skills_dir = PROJECT_ROOT / "generated_skills"
+        existing_skills: set[str] = set()
+        for f in skills_dir.glob("*.py"):
+            existing_skills.add(f.stem)
+
+        original_len = len(history)
+        history = [
+            entry for entry in history
+            if entry.get("skill_name", "") in existing_skills
+        ]
+        removed = original_len - len(history)
+
+        if removed > 0:
+            self._write_or_delete_log(history)
+            logger.info(f"quality_log.json 정리: {removed}건 제거 (존재하지 않는 스킬)")
+
+        return removed
 
     def _load_history(self) -> None:
         """이전 품질 로그에서 이력 복원."""

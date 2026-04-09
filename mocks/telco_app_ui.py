@@ -16,6 +16,8 @@ from fastapi.responses import HTMLResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("telco_app")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 app = FastAPI(title="SKT Agent 관리 앱 (Mock)", version="0.1.0")
 

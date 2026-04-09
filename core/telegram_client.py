@@ -14,17 +14,26 @@ class TelegramClient:
         self._is_polling = False
         self._last_update_id = 0
 
-    async def send_message(self, text: str, user_id: Optional[str] = None, reply_markup: Optional[dict] = None) -> dict:
-        """텔레그램 메시지 전송 (버튼 포함 가능)."""
+    async def send_message(self, text: str, user_id: Optional[str] = None, reply_markup: Optional[dict] = None, parse_mode: Optional[str] = None) -> dict:
+        """텔레그램 메시지 전송 (버튼 포함 가능).
+
+        Args:
+            text: 메시지 본문
+            user_id: 수신자 ID (생략 시 기본 user_id)
+            reply_markup: 인라인 키보드 등
+            parse_mode: "HTML" 또는 "MarkdownV2" (생략 시 plain text)
+        """
         if not self.token:
             return {"error": "TELEGRAM_BOT_TOKEN is not set"}
-        
+
         target_vuid = user_id or self.user_id
         if not target_vuid:
             return {"error": "Target user ID is missing"}
 
         url = f"{self.base_url}/sendMessage"
         payload = {"chat_id": target_vuid, "text": text}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         if reply_markup:
             payload["reply_markup"] = reply_markup
         

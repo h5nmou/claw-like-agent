@@ -33,11 +33,12 @@
 - 공식 서버의 장점: 보안성 높음, API 업데이트 기민 대응, 설정 표준화, 신뢰도 **high**
 - 예: "근처 맛집 찾아줘" → Google Maps MCP (`@modelcontextprotocol/server-google-maps`)
 
-**Tier 2 — 레지스트리 심층 탐색 (Smithery / Awesome-MCP)**
+**Tier 2 — Smithery Registry (REST API 직접 연동)**
 - Tier 1에서 공식 도구가 없거나, 더 특화된 기능이 필요할 때 발동
-- **Smithery.ai**: 커뮤니티 MCP 서버 마켓플레이스 → 기발하고 실용적인 변형 도구
-- **Awesome-MCP (GitHub)**: 엄선된 MCP 서버 목록 → 품질 보증
-- 분석 항목: Tool Schema, Requirements(API 키/설치), Reliability(별점/다운로드)
+- **Smithery REST API** (`api.smithery.ai`): 시맨틱 검색으로 MCP 서버 탐색 → 매니지드 프록시 연결
+- 로컬 설치 불필요 — Smithery가 MCP 서버를 호스팅하고 프록시를 통해 도구 호출
+- 환경변수: `SMITHERY_API_KEY` (없으면 기존 웹 검색 폴백)
+- **Awesome-MCP (GitHub)**: 웹 검색 폴백 시 엄선된 MCP 서버 목록 참조
 
 **Tier 3 — API / pip 폴백 (REST API Fallback)**
 - Tier 1~2에서 MCP를 찾지 못한 경우에만 발동
@@ -102,8 +103,25 @@
 
 ## 규칙 (Rules)
 
+### 탐색 우선순위 (Priority Ladder — 모든 도구 탐색에 적용)
+해결책을 찾을 때 반드시 다음 순서를 준수하라. **웹 검색은 최후의 수단이다.**
+
+1. **[Internal Skill]** 이미 생성된 스킬이 있는지 확인 (`list_all_available_tools`)
+2. **[Local MCP]** 현재 활성화된 MCP 도구 중 해결 가능한 것이 있는지 확인
+3. **[External MCP Discovery]** (가장 중요!) Smithery.ai나 공식 MCP 가이드를 검색하여, 해당 도메인에 특화된 MCP 서버가 있는지 먼저 탐색 → `create_new_skill` 호출 시 Skill Factory가 Tier 0~2에서 자동 탐색
+4. **[Web Search Fallback]** 위 1~3이 모두 실패했을 때만 일반 웹 검색(`web_search`, `create_local_guide`) 수행
+
+### Anti-Giveup Protocol (끈기 있는 탐색)
+- **"도구가 없어서 못 한다"는 보고 대신, "적절한 도구(MCP)를 외부에서 찾아서 새로운 스킬로 이식하겠다"는 대안을 반드시 제시**
+- 웹 검색 결과가 없거나 부실해도 작업을 중단하지 말 것
+
+### 데이터 신뢰도 가중치
+- 실시간 상태(예약, 날씨, 영업여부, 재고)와 관련된 요청은 **반드시 MCP 탐색을 우선**
+- 웹 검색 결과는 **보조 자료**로만 활용
+- LLM 사전 학습 데이터만으로 실시간 정보(장소, 맛집, 할인 등)를 생성하는 것은 **금지**
+
 ### Skill Factory 호출 판단 기준
-1. 사용 가능한 Tool을 모두 검토했음에도 요청을 수행할 방법이 없을 때 → `create_new_skill` 즉시 호출
+1. Priority Ladder ①~②를 확인하여 기존 도구/MCP로 처리 불가 확인 → `create_new_skill` 즉시 호출 (③~④ 자동 수행)
 2. 사용자가 명시적으로 "새 기능 만들어줘", "스킬 등록해줘" 라고 요청한 경우 → 즉시 호출
 3. 이미 등록된 스킬로 처리 가능한 요청 → **절대 Skill Factory를 거치지 말고 기존 스킬을 직접 호출**
 

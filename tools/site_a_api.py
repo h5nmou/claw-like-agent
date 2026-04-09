@@ -27,18 +27,20 @@ async def get_site_a_bookings() -> dict:
 
 
 @tool
-async def create_site_a_booking(room_id: str, guest_name: str, check_in: str, check_out: str) -> dict:
+async def create_site_a_booking(room_id: str, guest_name: str, check_in: str, check_out: str, guest_email: str = "") -> dict:
     """사이트 A에 새로운 예약을 생성합니다. (수동 예약 반영용)
-    
+
     Args:
         room_id: 대상 객실 (예: "room_101")
         guest_name: 투숙객 이름
         check_in: 체크인 날짜 (YYYY-MM-DD)
         check_out: 체크아웃 날짜 (YYYY-MM-DD)
+        guest_email: 투숙객 이메일 (선택)
     """
     payload = {
         "room_id": room_id,
         "guest_name": guest_name,
+        "guest_email": guest_email,
         "check_in": check_in,
         "check_out": check_out,
     }

@@ -20,16 +20,22 @@ from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("site_a")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 app = FastAPI(title="Mock Site A - 예약 사이트", version="0.1.0")
 
 ENGINE_WEBHOOK_URL = os.getenv("ENGINE_WEBHOOK_URL", "http://localhost:8000/webhook")
+
+# ── 숙소 위치 설정 ──────────────────────────────────
+PROPERTY_LOCATION = "제주도 애월읍"
 
 # ── 데이터 모델 ──────────────────────────────────────
 
 class BookingRequest(BaseModel):
     room_id: str
     guest_name: str
+    guest_email: str = ""  # 투숙객 이메일 (선택)
     check_in: str  # YYYY-MM-DD
     check_out: str  # YYYY-MM-DD
 
@@ -38,6 +44,7 @@ class Booking(BaseModel):
     booking_id: str
     room_id: str
     guest_name: str
+    guest_email: str = ""
     check_in: str
     check_out: str
     status: str  # "confirmed" | "cancelled"
@@ -50,6 +57,23 @@ ROOMS = {
 }
 
 bookings: dict[str, Booking] = {}
+
+# ── 날씨 상태 (수동 변경 가능) ───────────────────────
+
+WEATHER_OPTIONS = {
+    "sunny": {"label": "☀️ 맑음", "emoji": "☀️"},
+    "cloudy": {"label": "☁️ 흐림", "emoji": "☁️"},
+    "rain": {"label": "🌧️ 비", "emoji": "🌧️"},
+    "heavy_rain": {"label": "⛈️ 폭우", "emoji": "⛈️"},
+    "snow": {"label": "❄️ 눈", "emoji": "❄️"},
+    "heavy_snow": {"label": "🌨️ 폭설", "emoji": "🌨️"},
+    "wind": {"label": "🌬️ 강풍", "emoji": "🌬️"},
+    "typhoon": {"label": "🌀 태풍", "emoji": "🌀"},
+    "heat": {"label": "🔥 폭염", "emoji": "🔥"},
+    "cold": {"label": "🥶 한파", "emoji": "🥶"},
+}
+
+current_weather: dict = {"condition": "sunny", "changed_at": None}
 
 # 가용 현황 (Site B와 동일 구조)
 availability: dict[str, dict[str, bool]] = {}
@@ -99,6 +123,7 @@ async def send_webhook(event_type: str, booking: Booking) -> None:
         "booking": {
             "booking_id": booking.booking_id,
             "guest_name": booking.guest_name,
+            "guest_email": booking.guest_email,
             "room_id": booking.room_id,
             "check_in": booking.check_in,
             "check_out": booking.check_out,
@@ -112,11 +137,61 @@ async def send_webhook(event_type: str, booking: Booking) -> None:
         logger.error(f"Webhook failed: {e}")
 
 
+async def send_weather_webhook(
+    old_condition: str,
+    new_condition: str,
+    affected_bookings: list[dict],
+) -> None:
+    """날씨 변경 시 Engine에 Webhook 전송."""
+    payload = {
+        "event": "weather_changed",
+        "source": "site_a",
+        "location": PROPERTY_LOCATION,
+        "weather": {
+            "previous": old_condition,
+            "current": new_condition,
+            "label": WEATHER_OPTIONS.get(new_condition, {}).get("label", new_condition),
+        },
+        "affected_bookings": affected_bookings,
+    }
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(ENGINE_WEBHOOK_URL, json=payload, timeout=30.0)
+            logger.info(f"Weather webhook sent ({old_condition} → {new_condition}): {resp.status_code}")
+    except Exception as e:
+        logger.error(f"Weather webhook failed: {e}")
+
+
+def _get_today_bookings() -> list[dict]:
+    """오늘 숙박 중인 예약 목록 반환 (check_in <= today < check_out)."""
+    today = date.today().isoformat()
+    result = []
+    for b in bookings.values():
+        if b.status == "confirmed" and b.check_in <= today < b.check_out:
+            result.append({
+                "booking_id": b.booking_id,
+                "guest_name": b.guest_name,
+                "guest_email": b.guest_email,
+                "room_id": b.room_id,
+                "check_in": b.check_in,
+                "check_out": b.check_out,
+            })
+    return result
+
+
 # ── API 엔드포인트 ───────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
     today = date.today()
+
+    # ── 날씨 상태 ──
+    w_condition = current_weather["condition"]
+    w_label = WEATHER_OPTIONS.get(w_condition, {"label": w_condition})["label"]
+    weather_options_html = ""
+    for wk, wv in WEATHER_OPTIONS.items():
+        selected = "selected" if wk == w_condition else ""
+        weather_options_html += f'<option value="{wk}" {selected}>{wv["label"]}</option>'
 
     # ── 예약 목록 테이블 ──
     rows = ""
@@ -134,6 +209,7 @@ async def index():
         <tr>
             <td>{b.booking_id[:8]}...</td>
             <td>{b.guest_name}</td>
+            <td style="color:#94a3b8;font-size:0.8rem;">{b.guest_email or '-'}</td>
             <td>{b.check_in}</td>
             <td>{b.check_out}</td>
             <td>{status_badge}</td>
@@ -273,8 +349,24 @@ async def index():
 </head>
 <body>
     <div class="container">
-        <h1>🏨 Site A — 예약 관리</h1>
-        <p class="subtitle">Mock 예약 사이트 A · 예약 생성 시 Engine에 Webhook 전송 · 5초마다 자동 새로고침</p>
+        <h1>🏨 Site A — 예약 관리 ({PROPERTY_LOCATION})</h1>
+        <p class="subtitle">📍 {PROPERTY_LOCATION} · 예약 생성 시 Engine에 Webhook 전송 · 5초마다 자동 새로고침</p>
+
+        <div class="card" id="weather-section">
+            <h2>🌤️ 현재 날씨</h2>
+            <div style="display:flex; align-items:center; gap:1.5rem; margin-top:0.5rem;">
+                <span id="weather-display" style="font-size:2.5rem;">{w_label}</span>
+                <div style="display:flex; flex-direction:column; gap:0.5rem; flex:1;">
+                    <label style="font-size:0.8rem; color:#94a3b8;">날씨 변경 (Engine에 Webhook 전송)</label>
+                    <div style="display:flex; gap:0.5rem;">
+                        <select id="weather-select" style="flex:1; background:rgba(15,23,42,0.6); border:1px solid rgba(148,163,184,0.2); border-radius:8px; padding:0.6rem; color:#e2e8f0; font-size:0.9rem;">
+                            {weather_options_html}
+                        </select>
+                        <button onclick="changeWeather()" style="grid-column:auto; padding:0.6rem 1.2rem; font-size:0.85rem;">변경</button>
+                    </div>
+                </div>
+            </div>
+        </div>
 
         <div class="card" id="calendar-section">
             <h2>📅 가용 현황</h2>
@@ -283,7 +375,7 @@ async def index():
 
         <div class="card">
             <h2>📋 예약 목록</h2>
-            <div id="booking-list">{"<table><thead><tr><th>ID</th><th>투숙객</th><th>체크인</th><th>체크아웃</th><th>상태</th><th></th></tr></thead><tbody>" + rows + "</tbody></table>" if rows else '<p class="empty">예약이 없습니다</p>'}</div>
+            <div id="booking-list">{"<table><thead><tr><th>ID</th><th>투숙객</th><th>이메일</th><th>체크인</th><th>체크아웃</th><th>상태</th><th></th></tr></thead><tbody>" + rows + "</tbody></table>" if rows else '<p class="empty">예약이 없습니다</p>'}</div>
         </div>
 
         <div class="card">
@@ -293,9 +385,11 @@ async def index():
                     <label>투숙객 이름</label>
                     <input type="text" name="guest_name" required placeholder="홍길동">
                 </div>
-                <div class="form-group" style="display:none">
-                    <input type="hidden" name="room_id" value="room_101">
+                <div class="form-group">
+                    <label>이메일</label>
+                    <input type="email" name="guest_email" placeholder="guest@example.com">
                 </div>
+                <input type="hidden" name="room_id" value="room_101">
                 <div class="form-group">
                     <label>체크인</label>
                     <input type="date" name="check_in" required>
@@ -309,27 +403,43 @@ async def index():
         </div>
     </div>
     <script>
-    setInterval(async () => {{
+    async function refreshPartial() {{
         try {{
             const resp = await fetch('/partial');
             const data = await resp.json();
             document.getElementById('calendar-section').innerHTML = '<h2>📅 가용 현황</h2>' + data.calendar_html;
             document.getElementById('booking-list').innerHTML = data.bookings_html;
+            document.getElementById('weather-display').textContent = data.weather_label;
         }} catch(e) {{}}
-    }}, 5000);
+    }}
+
+    setInterval(refreshPartial, 5000);
 
     async function cancelBooking(bookingId) {{
         if (!confirm('이 예약을 취소하시겠습니까?')) return;
         try {{
             const resp = await fetch('/bookings/' + bookingId, {{method: 'DELETE'}});
-            if (resp.ok) {{
-                const partial = await fetch('/partial');
-                const data = await partial.json();
-                document.getElementById('calendar-section').innerHTML = '<h2>📅 가용 현황</h2>' + data.calendar_html;
-                document.getElementById('booking-list').innerHTML = data.bookings_html;
-            }}
+            if (resp.ok) await refreshPartial();
         }} catch(e) {{
             alert('취소 실패: ' + e.message);
+        }}
+    }}
+
+    async function changeWeather() {{
+        const sel = document.getElementById('weather-select');
+        const newCondition = sel.value;
+        try {{
+            const resp = await fetch('/weather', {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{condition: newCondition}})
+            }});
+            const data = await resp.json();
+            if (data.webhook_sent) {{
+                document.getElementById('weather-display').textContent = data.label;
+            }}
+        }} catch(e) {{
+            alert('날씨 변경 실패: ' + e.message);
         }}
     }}
     </script>
@@ -389,12 +499,13 @@ def _build_bookings_html() -> str:
         rows += (
             f"<tr><td>{b.booking_id[:8]}...</td>"
             f"<td>{b.guest_name}</td>"
+            f'<td style="color:#94a3b8;font-size:0.8rem;">{b.guest_email or "-"}</td>'
             f"<td>{b.check_in}</td><td>{b.check_out}</td>"
             f"<td>{status_badge}</td>"
             f"<td>{cancel_btn}</td></tr>"
         )
     return (
-        "<table><thead><tr><th>ID</th><th>투숙객</th><th>체크인</th>"
+        "<table><thead><tr><th>ID</th><th>투숙객</th><th>이메일</th><th>체크인</th>"
         "<th>체크아웃</th><th>상태</th><th></th></tr></thead><tbody>"
         + rows + "</tbody></table>"
     )
@@ -402,10 +513,13 @@ def _build_bookings_html() -> str:
 
 @app.get("/partial")
 async def partial():
-    """JS로 부분 갱신할 달력 + 예약 목록 HTML을 JSON으로 반환."""
+    """JS로 부분 갱신할 달력 + 예약 목록 + 날씨 HTML을 JSON으로 반환."""
+    w_condition = current_weather["condition"]
+    w_label = WEATHER_OPTIONS.get(w_condition, {"label": w_condition})["label"]
     return {
         "calendar_html": _build_calendar_html(),
         "bookings_html": _build_bookings_html(),
+        "weather_label": w_label,
     }
 
 
@@ -420,6 +534,7 @@ async def create_booking(req: BookingRequest):
         booking_id=str(uuid.uuid4()),
         room_id=req.room_id,
         guest_name=req.guest_name,
+        guest_email=req.guest_email,
         check_in=req.check_in,
         check_out=req.check_out,
         status="confirmed",
@@ -438,6 +553,7 @@ async def create_booking(req: BookingRequest):
 async def create_booking_form(
     room_id: str = FastAPIForm(...),
     guest_name: str = FastAPIForm(...),
+    guest_email: str = FastAPIForm(""),
     check_in: str = FastAPIForm(...),
     check_out: str = FastAPIForm(...),
 ):
@@ -446,6 +562,7 @@ async def create_booking_form(
         booking_id=str(uuid.uuid4()),
         room_id=room_id,
         guest_name=guest_name,
+        guest_email=guest_email,
         check_in=check_in,
         check_out=check_out,
         status="confirmed",
@@ -474,3 +591,55 @@ async def cancel_booking(booking_id: str):
     asyncio.create_task(send_webhook("booking_cancelled", booking))
 
     return booking.model_dump()
+
+
+# ── 날씨 API ────────────────────────────────────────
+
+@app.get("/weather")
+async def get_weather():
+    """현재 날씨 상태 조회."""
+    w = current_weather["condition"]
+    return {
+        "condition": w,
+        "label": WEATHER_OPTIONS.get(w, {"label": w})["label"],
+        "changed_at": current_weather.get("changed_at"),
+    }
+
+
+@app.post("/weather")
+async def change_weather(request: dict):
+    """날씨를 수동으로 변경하고, 오늘 숙박 중인 예약이 있으면 Engine에 Webhook 전송."""
+    from datetime import datetime as dt
+
+    new_condition = request.get("condition", "sunny")
+    if new_condition not in WEATHER_OPTIONS:
+        return {"error": f"Unknown condition: {new_condition}"}
+
+    old_condition = current_weather["condition"]
+    if old_condition == new_condition:
+        return {"changed": False, "message": "날씨가 동일합니다.", "webhook_sent": False}
+
+    current_weather["condition"] = new_condition
+    current_weather["changed_at"] = dt.now().isoformat()
+
+    label = WEATHER_OPTIONS[new_condition]["label"]
+    logger.info(f"Weather changed: {old_condition} → {new_condition} ({label})")
+
+    # 오늘 숙박 중인 예약 조회
+    affected = _get_today_bookings()
+
+    # 오늘 숙박 중인 예약이 있으면 날씨 변경 webhook 전송 (모든 날씨)
+    webhook_sent = False
+    if affected:
+        asyncio.create_task(send_weather_webhook(old_condition, new_condition, affected))
+        webhook_sent = True
+        logger.info(f"Weather webhook queued: {len(affected)} affected bookings")
+
+    return {
+        "changed": True,
+        "previous": old_condition,
+        "current": new_condition,
+        "label": label,
+        "affected_bookings": len(affected),
+        "webhook_sent": webhook_sent,
+    }

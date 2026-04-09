@@ -18,27 +18,27 @@ import uvicorn
 
 def run_telco():
     print("🔐 Starting Telco Trust Server on port 8003...")
-    uvicorn.run("mocks.telco_server:app", host="0.0.0.0", port=8003, log_level="info")
+    uvicorn.run("mocks.telco_server:app", host="0.0.0.0", port=8003, log_level="warning")
 
 
 def run_telco_app():
     print("📱 Starting Telco App UI on port 8004...")
-    uvicorn.run("mocks.telco_app_ui:app", host="0.0.0.0", port=8004, log_level="info")
+    uvicorn.run("mocks.telco_app_ui:app", host="0.0.0.0", port=8004, log_level="warning")
 
 
 def run_site_b():
     print("🟢 Starting Mock Site B on port 8002...")
-    uvicorn.run("mocks.site_b:app", host="0.0.0.0", port=8002, log_level="info")
+    uvicorn.run("mocks.site_b:app", host="0.0.0.0", port=8002, log_level="warning")
 
 
 def run_engine():
     print("🧠 Starting Engine on port 8000...")
-    uvicorn.run("core.engine:app", host="0.0.0.0", port=8000, log_level="info")
+    uvicorn.run("core.engine:app", host="0.0.0.0", port=8000, log_level="warning")
 
 
 def run_site_a():
     print("🏨 Starting Mock Site A on port 8001...")
-    uvicorn.run("mocks.site_a:app", host="0.0.0.0", port=8001, log_level="info")
+    uvicorn.run("mocks.site_a:app", host="0.0.0.0", port=8001, log_level="warning")
 
 
 if __name__ == "__main__":

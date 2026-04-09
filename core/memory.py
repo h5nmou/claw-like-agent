@@ -5,7 +5,7 @@ memory.py — 세션 이벤트 로그 관리 (단기 메모리)
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass, field, asdict
 from typing import Any
 
@@ -31,7 +31,7 @@ class Memory:
 
     def add_event(self, role: str, content: Any) -> None:
         event = Event(
-            timestamp=datetime.utcnow().isoformat(),
+            timestamp=datetime.now(timezone.utc).isoformat(),
             role=role,
             content=content,
         )
