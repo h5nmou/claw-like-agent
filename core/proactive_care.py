@@ -407,7 +407,7 @@ class ProactiveCareEngine:
             "skill_name": skill_name,
             "skill_args_template": skill_args_template,
             "approval_count": 1,
-            "auto_execute": False,  # 3회 이상 승인 시 True로 전환
+            "auto_execute": True,  # 사장님이 명시적으로 승인했으므로 즉시 자동 실행 활성화
             "created_at": datetime.now().isoformat(),
             "last_approved": datetime.now().isoformat(),
         }

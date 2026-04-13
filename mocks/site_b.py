@@ -101,26 +101,27 @@ async def index():
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{
             font-family: 'Inter', -apple-system, sans-serif;
-            background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
-            color: #e2e8f0; min-height: 100vh; padding: 2rem;
+            background: #f8fafc;
+            color: #1e293b; min-height: 100vh; padding: 2rem;
         }}
         .container {{ max-width: 900px; margin: 0 auto; }}
         h1 {{
             font-size: 1.8rem;
-            background: linear-gradient(90deg, #34d399, #38bdf8);
+            background: linear-gradient(90deg, #16a34a, #2563eb);
             -webkit-background-clip: text; -webkit-text-fill-color: transparent;
             margin-bottom: 0.5rem;
         }}
-        .subtitle {{ color: #94a3b8; margin-bottom: 1.5rem; font-size: 0.9rem; }}
-        .legend {{ display: flex; gap: 1.5rem; margin-bottom: 1.5rem; font-size: 0.8rem; color: #94a3b8; }}
+        .subtitle {{ color: #64748b; margin-bottom: 1.5rem; font-size: 0.9rem; }}
+        .legend {{ display: flex; gap: 1.5rem; margin-bottom: 1.5rem; font-size: 0.8rem; color: #64748b; }}
         .legend-item {{ display: flex; align-items: center; gap: 0.4rem; }}
         .legend-dot {{ width: 10px; height: 10px; border-radius: 50%; }}
         .card {{
-            background: rgba(30, 41, 59, 0.8);
-            border: 1px solid rgba(148, 163, 184, 0.1);
+            background: #ffffff;
+            border: 1px solid #e2e8f0;
             border-radius: 12px; padding: 1.5rem; margin-bottom: 1rem;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.06);
         }}
-        .card h2 {{ font-size: 1rem; color: #cbd5e1; margin-bottom: 0.5rem; }}
+        .card h2 {{ font-size: 1rem; color: #334155; margin-bottom: 0.5rem; }}
     </style>
     <meta http-equiv="refresh" content="5">
 </head>

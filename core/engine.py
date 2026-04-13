@@ -115,6 +115,25 @@ async def startup_skill_registry():
     from core.skill_healer import set_briefing_hook
 
     await broadcaster.emit("divider", "PHASE 0.6 — Enterprise Skill Ecosystem 초기화", "")
+
+    # ── 이전 세션의 임시 파일 정리 ──
+    _temp_files = [
+        Path("generated_skills/pending_care_task.json"),
+        Path("generated_skills/pending_intent.json"),
+        Path("generated_skills/pending_email_task.json"),
+    ]
+    _cleaned = []
+    for _tf in _temp_files:
+        if _tf.exists():
+            _tf.unlink()
+            _cleaned.append(_tf.name)
+    if _cleaned:
+        await broadcaster.emit(
+            "system",
+            f"🧹 이전 세션 임시 파일 정리: {', '.join(_cleaned)}",
+            "⚙️ Startup Cleanup"
+        )
+
     await broadcaster.emit("system", "📚 [로그 분석 중...] 스킬 라이브러리 초기화...", "⚙️ Skill Registry")
 
     # broadcaster.emit을 skill_factory, self-healer, proactive care의 로그 훅으로 연결
@@ -244,6 +263,7 @@ async def handle_telegram_message(text: str, chat_id: str):
                 f"    → 이 도구가 사장님에게 텔레그램으로 자동화 등록 여부를 질문합니다.\n"
                 f"    → 사장님이 승인하면 시스템이 자동으로 규칙을 등록합니다.\n"
                 f"    ⛔ register_care_rule을 직접 호출하지 마세요!\n"
+                f"    ⛔ send_telegram_message로 '자동화 등록' 버튼을 직접 만들지 마세요! propose_care_automation만 사용하세요.\n"
                 f"\n⚠️ 규칙 등록만 하고 끝내지 마세요! STEP 1~4를 반드시 먼저 수행하세요.\n"
                 f"⚠️ 환경변수가 여러 개 필요하면 한꺼번에 요구하지 말고, 현재 STEP에 필요한 것만 안내 후 멈추세요.\n"
             )
@@ -319,7 +339,7 @@ async def handle_telegram_message(text: str, chat_id: str):
             )
         return
 
-    elif text == "auto_rule_no":
+    elif text == "auto_rule_no" or text in ("등록 안함", "자동화 안함", "No", "[등록 안함]", "[자동화 안함]"):
         pending_rule = get_pending_auto_rule()
         clear_pending_auto_rule()
         await broadcaster.emit(
@@ -331,8 +351,54 @@ async def handle_telegram_message(text: str, chat_id: str):
         )
         return
 
+    # ── 자동화 등록 텍스트 버튼 fallback (LLM이 propose_care_automation 대신 send_telegram_message를 쓴 경우) ──
+    # 대괄호 포함 변형([자동화 등록])도 처리
+    elif text.strip("[]") in ("자동화 등록", "Yes", "등록"):
+        pending_rule = get_pending_auto_rule()
+        if pending_rule:
+            clear_pending_auto_rule()
+            care_engine = get_care_engine()
+            care_engine.register_rule(
+                trigger_category=pending_rule["trigger_category"],
+                approved_action=pending_rule["approved_action"],
+                skill_name=pending_rule.get("skill_name"),
+            )
+            await broadcaster.emit(
+                "system",
+                f"✅ 자동화 규칙 등록 완료 (텍스트 버튼 fallback): {pending_rule['approved_action']}",
+                "[선제적 케어]",
+            )
+            await telegram_client.send_message(
+                f"✅ 자동화 규칙이 등록되었습니다.\n"
+                f"- 트리거: {pending_rule['trigger_category']}\n"
+                f"- 액션: {pending_rule['approved_action']}\n"
+                f"다음에 동일 조건 발생 시 자동으로 제안됩니다.",
+                user_id=chat_id,
+            )
+        else:
+            # pending_rule 없음 → LLM이 propose_care_automation을 우회한 경우
+            # agent loop에서 최근 수행한 케어 액션을 register_care_rule로 등록하도록 위임
+            await broadcaster.emit(
+                "system",
+                "⚠️ [자동화 등록 버튼] pending_rule 없음 — LLM이 propose_care_automation 우회한 케이스. Agent에게 위임",
+                "[선제적 케어]",
+            )
+            event = {
+                "event": "auto_rule_register_request",
+                "message": text,
+                "chat_id": chat_id,
+                "instruction": (
+                    "사장님이 방금 수행한 케어 액션(날씨 변화 감지 후 실내 장소 가이드 생성 + 이메일 전송)을 자동화 규칙으로 등록해주세요. "
+                    "register_care_rule을 호출하여 trigger_category(예: weather_rain), "
+                    "approved_action(방금 수행한 액션 요약), skill_name(사용한 스킬명)을 등록하세요. "
+                    "등록 후 사장님에게 텔레그램으로 완료 보고하세요."
+                ),
+            }
+            asyncio.create_task(run_agent_loop(event))
+        return
+
     # ── Proactive Care: 키워드 감지 (일반 메시지) ──
-    elif not text.startswith("care_") and not text.startswith("auto_rule_"):
+    elif not text.startswith("care_") and not text.startswith("auto_rule_") and text.strip("[]") not in ("자동화 등록", "등록 안함", "자동화 안함", "Yes", "No", "등록"):
         care_engine = get_care_engine()
         care_result = await care_engine.process_message(text)
         if care_result:

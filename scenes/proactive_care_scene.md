@@ -164,6 +164,11 @@ STEP 5: 자동화 등록 질문 (사장님 승인 필수)
 - `list_all_available_tools` → `web_search` 바로 호출 (③ MCP Discovery 건너뜀)
 - 장소/맛집/관광지 요청에서 `create_new_skill`을 한 번도 호출하지 않는 것
 
+### 지도/장소 서비스 선호도
+- **Google Maps를 최우선 사용** (카카오맵보다 Google Maps 선호)
+- MCP Discovery 시 Google Maps MCP를 먼저 탐색
+- 웹 검색 폴백 시에도 Google Maps 기반 결과를 우선
+
 ### 데이터 신뢰도 가중치
 | 데이터 소스 | 신뢰도 | 용도 |
 |-------------|--------|------|

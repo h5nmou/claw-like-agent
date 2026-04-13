@@ -259,11 +259,10 @@ async def send_telegram_message(message: str, buttons: list[str] = None) -> dict
                 buttons = [buttons]
 
         if isinstance(buttons, list):
-            keyboard = [[{"text": str(btn)}] for btn in buttons]
+            # inline_keyboard: 메시지에 붙는 버튼, callback_data = 버튼 텍스트
+            keyboard = [[{"text": str(btn), "callback_data": str(btn)}] for btn in buttons]
             reply_markup = {
-                "keyboard": keyboard,
-                "resize_keyboard": True,
-                "one_time_keyboard": True
+                "inline_keyboard": keyboard
             }
 
     result = await telegram_client.send_message(message, reply_markup=reply_markup)

@@ -15,9 +15,13 @@
 스킬이 생성될 때 다음 Tiered Strategy에 따라 자동으로 수행됩니다. 사장님께 진행 상황을 실시간으로 보고하세요.
 
 ```
-[Tier 0: 로컬 MCP] → [Tier 1: 공식 MCP] → [Tier 2: 레지스트리] → [Tier 3: API 폴백]
+[Tier 0: 로컬 MCP] → [Tier 1★: Gmail / Google Maps MCP 최우선] → [Tier 1: 기타 공식 MCP]
+→ [Tier 2: Smithery Registry] → [Tier 3: REST API 폴백 (웹검색 최후 수단)]
 → [코드 합성] → [피어 리뷰] → [보안 스캔] → [카테고리 분류] → [등록 완료]
 ```
+
+> ⭐ **절대 우선순위**: 이메일 → **Gmail MCP** / 지도·장소 → **Google Maps MCP** / 나머지 → **Smithery Registry**
+> 이 세 가지를 모두 시도한 후에만 웹검색(Tier 3)을 사용하라.
 
 ### 단계별 탐색 전략 (Tiered Strategy)
 
@@ -27,22 +31,32 @@
 - 이미 연결된 MCP 서버(Phone-MCP 등)에서 `tools/list`로 도구 탐색
 - 추가 설정 없이 즉시 사용 가능 → **최우선 선택**
 
-**Tier 1 — 메이저 서비스 공식 MCP (Official/Standard)**
-- 대상: Google Maps, Gmail, GitHub, Slack, Notion, Puppeteer 등
-- MCP 표준 라이브러리(`modelcontextprotocol/servers`)에 포함된 **공식 서버**를 먼저 확인
+**Tier 1★ — Gmail / Google Maps 공식 MCP (절대 최우선)**
+- ✉️ **이메일 관련 요청** → `@modelcontextprotocol/server-gmail` **반드시 먼저 시도**
+  - "이메일 보내줘", "메일 확인", "받은편지함" 등 모든 이메일 요청
+  - SMTP 직접 구현보다 Gmail MCP가 항상 우선
+- 🗺️ **지도/장소/경로 관련 요청** → `@modelcontextprotocol/server-google-maps` **반드시 먼저 시도**
+  - "근처 맛집", "경로 찾아줘", "장소 검색", "위치 정보" 등 모든 위치 요청
+  - 카카오맵보다 Google Maps 우선, 기타 지도 API보다 Google Maps 우선
+- **⛔ 금지**: Gmail/Google Maps 없이 바로 웹검색하거나 다른 이메일/지도 API 사용 금지
+- 🤖 **자동 실행**: MCP 서버가 로컬에 없어도 Agent가 `npx` 명령을 **자동으로 직접 실행**하여 탐색합니다. 사장님에게 별도 설치 요청 없이 처리됩니다.
+
+**Tier 1 — 기타 메이저 서비스 공식 MCP (Official/Standard)**
+- 대상: GitHub, Slack, Notion, Puppeteer 등
+- MCP 표준 라이브러리(`modelcontextprotocol/servers`)에 포함된 **공식 서버** 확인
 - 공식 서버의 장점: 보안성 높음, API 업데이트 기민 대응, 설정 표준화, 신뢰도 **high**
-- 예: "근처 맛집 찾아줘" → Google Maps MCP (`@modelcontextprotocol/server-google-maps`)
 
 **Tier 2 — Smithery Registry (REST API 직접 연동)**
 - Tier 1에서 공식 도구가 없거나, 더 특화된 기능이 필요할 때 발동
 - **Smithery REST API** (`api.smithery.ai`): 시맨틱 검색으로 MCP 서버 탐색 → 매니지드 프록시 연결
 - 로컬 설치 불필요 — Smithery가 MCP 서버를 호스팅하고 프록시를 통해 도구 호출
-- 환경변수: `SMITHERY_API_KEY` (없으면 기존 웹 검색 폴백)
-- **Awesome-MCP (GitHub)**: 웹 검색 폴백 시 엄선된 MCP 서버 목록 참조
+- 환경변수: `SMITHERY_API_KEY` (없으면 Tier 3 폴백)
+- **Gmail/Google Maps가 해결 못하는 모든 도메인**은 Smithery에서 먼저 탐색
 
-**Tier 3 — API / pip 폴백 (REST API Fallback)**
-- Tier 1~2에서 MCP를 찾지 못한 경우에만 발동
+**Tier 3 — API / pip 폴백 (REST API Fallback) — 최후의 수단**
+- **Tier 0~2를 모두 시도한 후에만 사용**
 - 공식 REST API, pip 패키지, 공공데이터포털(data.go.kr) 순서로 탐색
+- **⛔ 웹검색은 Gmail/Google Maps/Smithery를 먼저 시도한 후 모두 실패했을 때만 허용**
 
 ### 도구 이식 기준 (Integration Decision)
 > "사용자가 API 키를 새로 발급받아야 하는가?"
@@ -104,12 +118,14 @@
 ## 규칙 (Rules)
 
 ### 탐색 우선순위 (Priority Ladder — 모든 도구 탐색에 적용)
-해결책을 찾을 때 반드시 다음 순서를 준수하라. **웹 검색은 최후의 수단이다.**
+해결책을 찾을 때 반드시 다음 순서를 준수하라. **Gmail/Google Maps/Smithery를 먼저, 웹 검색은 최후의 수단이다.**
 
 1. **[Internal Skill]** 이미 생성된 스킬이 있는지 확인 (`list_all_available_tools`)
 2. **[Local MCP]** 현재 활성화된 MCP 도구 중 해결 가능한 것이 있는지 확인
-3. **[External MCP Discovery]** (가장 중요!) Smithery.ai나 공식 MCP 가이드를 검색하여, 해당 도메인에 특화된 MCP 서버가 있는지 먼저 탐색 → `create_new_skill` 호출 시 Skill Factory가 Tier 0~2에서 자동 탐색
-4. **[Web Search Fallback]** 위 1~3이 모두 실패했을 때만 일반 웹 검색(`web_search`, `create_local_guide`) 수행
+3. **[Gmail MCP]** 이메일/메일 관련 요청이면 → `@modelcontextprotocol/server-gmail` 먼저 시도
+4. **[Google Maps MCP]** 지도/장소/경로 관련 요청이면 → `@modelcontextprotocol/server-google-maps` 먼저 시도
+5. **[Smithery Registry]** Gmail/Google Maps로 해결 안 되면 → Smithery.ai에서 특화된 MCP 서버 탐색
+6. **[Web Search Fallback]** 위 1~5가 모두 실패했을 때만 일반 웹 검색 수행 (절대 최후 수단)
 
 ### Anti-Giveup Protocol (끈기 있는 탐색)
 - **"도구가 없어서 못 한다"는 보고 대신, "적절한 도구(MCP)를 외부에서 찾아서 새로운 스킬로 이식하겠다"는 대안을 반드시 제시**

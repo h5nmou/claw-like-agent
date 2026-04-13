@@ -265,55 +265,56 @@ async def index():
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{
             font-family: 'Inter', -apple-system, sans-serif;
-            background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
-            color: #e2e8f0;
+            background: #f8fafc;
+            color: #1e293b;
             min-height: 100vh;
             padding: 2rem;
         }}
         .container {{ max-width: 900px; margin: 0 auto; }}
         h1 {{
             font-size: 1.8rem;
-            background: linear-gradient(90deg, #38bdf8, #818cf8);
+            background: linear-gradient(90deg, #2563eb, #7c3aed);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
             margin-bottom: 0.5rem;
         }}
-        .subtitle {{ color: #94a3b8; margin-bottom: 2rem; font-size: 0.9rem; }}
+        .subtitle {{ color: #64748b; margin-bottom: 2rem; font-size: 0.9rem; }}
         .card {{
-            background: rgba(30, 41, 59, 0.8);
-            border: 1px solid rgba(148, 163, 184, 0.1);
+            background: #ffffff;
+            border: 1px solid #e2e8f0;
             border-radius: 12px;
             padding: 1.5rem;
             margin-bottom: 1.5rem;
-            backdrop-filter: blur(10px);
+            box-shadow: 0 1px 3px rgba(0,0,0,0.06);
         }}
-        .card h2 {{ font-size: 1.1rem; color: #cbd5e1; margin-bottom: 1rem; }}
+        .card h2 {{ font-size: 1.1rem; color: #334155; margin-bottom: 1rem; }}
         table {{ width: 100%; border-collapse: collapse; }}
         th, td {{
             padding: 0.75rem;
             text-align: left;
-            border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+            border-bottom: 1px solid #f1f5f9;
             font-size: 0.85rem;
         }}
-        th {{ color: #94a3b8; font-weight: 600; text-transform: uppercase; font-size: 0.75rem; }}
+        th {{ color: #64748b; font-weight: 600; text-transform: uppercase; font-size: 0.75rem; }}
         .form-grid {{
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 1rem;
         }}
         .form-group {{ display: flex; flex-direction: column; gap: 0.3rem; }}
-        label {{ font-size: 0.8rem; color: #94a3b8; }}
+        label {{ font-size: 0.8rem; color: #64748b; }}
         input, select {{
-            background: rgba(15, 23, 42, 0.6);
-            border: 1px solid rgba(148, 163, 184, 0.2);
+            background: #ffffff;
+            border: 1px solid #d1d5db;
             border-radius: 8px;
             padding: 0.6rem;
-            color: #e2e8f0;
+            color: #1e293b;
             font-size: 0.9rem;
         }}
+        input:focus, select:focus {{ outline: none; border-color: #3b82f6; }}
         button {{
             grid-column: 1 / -1;
-            background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+            background: linear-gradient(135deg, #3b82f6, #7c3aed);
             border: none;
             border-radius: 8px;
             padding: 0.75rem;
@@ -324,11 +325,11 @@ async def index():
             transition: opacity 0.2s;
         }}
         button:hover {{ opacity: 0.9; }}
-        .empty {{ color: #64748b; text-align: center; padding: 2rem; }}
+        .empty {{ color: #94a3b8; text-align: center; padding: 2rem; }}
         .btn-cancel {{
-            background: rgba(239, 68, 68, 0.15);
-            color: #f87171;
-            border: 1px solid rgba(239, 68, 68, 0.3);
+            background: rgba(239, 68, 68, 0.08);
+            color: #dc2626;
+            border: 1px solid rgba(239, 68, 68, 0.25);
             border-radius: 6px;
             padding: 0.3rem 0.7rem;
             font-size: 0.75rem;
@@ -336,12 +337,12 @@ async def index():
             transition: all 0.2s;
         }}
         .btn-cancel:hover {{
-            background: rgba(239, 68, 68, 0.3);
-            color: #fca5a5;
+            background: rgba(239, 68, 68, 0.15);
+            color: #b91c1c;
         }}
         .legend {{
             display: flex; gap: 1.5rem; margin-bottom: 0.5rem;
-            font-size: 0.8rem; color: #94a3b8;
+            font-size: 0.8rem; color: #64748b;
         }}
         .legend-item {{ display: flex; align-items: center; gap: 0.4rem; }}
         .legend-dot {{ width: 10px; height: 10px; border-radius: 50%; }}
@@ -359,7 +360,7 @@ async def index():
                 <div style="display:flex; flex-direction:column; gap:0.5rem; flex:1;">
                     <label style="font-size:0.8rem; color:#94a3b8;">날씨 변경 (Engine에 Webhook 전송)</label>
                     <div style="display:flex; gap:0.5rem;">
-                        <select id="weather-select" style="flex:1; background:rgba(15,23,42,0.6); border:1px solid rgba(148,163,184,0.2); border-radius:8px; padding:0.6rem; color:#e2e8f0; font-size:0.9rem;">
+                        <select id="weather-select" style="flex:1; background:#ffffff; border:1px solid #d1d5db; border-radius:8px; padding:0.6rem; color:#1e293b; font-size:0.9rem;">
                             {weather_options_html}
                         </select>
                         <button onclick="changeWeather()" style="grid-column:auto; padding:0.6rem 1.2rem; font-size:0.85rem;">변경</button>
@@ -380,6 +381,7 @@ async def index():
 
         <div class="card">
             <h2>➕ 새 예약 생성</h2>
+
             <form method="post" action="/bookings-form" class="form-grid">
                 <div class="form-group">
                     <label>투숙객 이름</label>
@@ -400,6 +402,20 @@ async def index():
                 </div>
                 <button type="submit">예약 생성 (Webhook 전송)</button>
             </form>
+        </div>
+
+        <div class="card" style="border:1.5px solid #7c3aed22; background:linear-gradient(135deg,#f5f3ff,#eff6ff);">
+            <h2 style="color:#7c3aed;">⚡ 빠른 예약 — hayden</h2>
+            <p style="font-size:0.82rem; color:#64748b; margin-bottom:1rem;">
+                이름: <b>hayden</b> · 이메일: <b>h5nmou@gmail.com</b> · 객실: <b>스위트 룸</b> · 기간: <b>오늘 ~ 내일</b>
+            </p>
+            <button onclick="quickBook()" style="
+                background:linear-gradient(135deg,#7c3aed,#2563eb);
+                border:none; border-radius:8px; padding:0.7rem 1.8rem;
+                color:white; font-weight:700; font-size:0.95rem;
+                cursor:pointer; transition:opacity 0.2s;
+            ">🚀 지금 예약 생성 (Webhook 전송)</button>
+            <span id="quick-book-result" style="margin-left:1rem; font-size:0.85rem; color:#22c55e;"></span>
         </div>
     </div>
     <script>
@@ -422,6 +438,41 @@ async def index():
             if (resp.ok) await refreshPartial();
         }} catch(e) {{
             alert('취소 실패: ' + e.message);
+        }}
+    }}
+
+    async function quickBook() {{
+        const today = new Date();
+        const tomorrow = new Date(today);
+        tomorrow.setDate(tomorrow.getDate() + 1);
+        const fmt = d => d.toISOString().slice(0, 10);
+        const resultEl = document.getElementById('quick-book-result');
+        resultEl.style.color = '#94a3b8';
+        resultEl.textContent = '처리 중...';
+        try {{
+            const resp = await fetch('/bookings', {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{
+                    room_id: 'room_101',
+                    guest_name: 'hayden',
+                    guest_email: 'h5nmou@gmail.com',
+                    check_in: fmt(today),
+                    check_out: fmt(tomorrow),
+                }})
+            }});
+            const data = await resp.json();
+            if (data.booking_id) {{
+                resultEl.style.color = '#22c55e';
+                resultEl.textContent = `✓ 예약 완료 (ID: ${{data.booking_id.slice(0,8)}}...)`;
+                await refreshPartial();
+            }} else {{
+                resultEl.style.color = '#ef4444';
+                resultEl.textContent = '예약 실패: ' + JSON.stringify(data);
+            }}
+        }} catch(e) {{
+            resultEl.style.color = '#ef4444';
+            resultEl.textContent = '오류: ' + e.message;
         }}
     }}
 

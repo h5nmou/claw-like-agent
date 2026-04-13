@@ -139,13 +139,32 @@ class APIDiscovery:
     # Google, Slack, GitHub 등 공식/표준 MCP 서버가 존재하는 서비스 목록.
     # modelcontextprotocol/servers 공식 레포 기준.
     _OFFICIAL_MCP_MAP: dict[str, dict] = {
-        "google": {
-            "keywords": ["gmail", "google", "drive", "calendar", "google maps", "구글", "지메일", "구글맵", "구글드라이브"],
+        "gmail": {
+            "keywords": ["gmail", "email", "이메일", "메일", "지메일", "mail", "send email", "receive email", "받은편지함"],
+            "server": "@modelcontextprotocol/server-gmail",
+            "source": "github.com/modelcontextprotocol/servers",
+            "install": "npx -y @modelcontextprotocol/server-gmail",
+            "env_key": "GMAIL_OAUTH_CREDENTIALS",
+            "description": "Gmail MCP — 이메일 전송, 읽기, 검색, 라벨 관리",
+            "priority": 1,
+        },
+        "google_maps": {
+            "keywords": ["map", "maps", "google maps", "장소", "위치", "경로", "지도", "맛집", "근처", "주변", "geocode", "directions", "place search", "구글맵", "구글지도", "위도", "경도"],
             "server": "@modelcontextprotocol/server-google-maps",
             "source": "github.com/modelcontextprotocol/servers",
             "install": "npx -y @modelcontextprotocol/server-google-maps",
             "env_key": "GOOGLE_MAPS_API_KEY",
             "description": "Google Maps Platform MCP — 장소 검색, 경로, 지오코딩",
+            "priority": 1,
+        },
+        "google": {
+            "keywords": ["google", "drive", "calendar", "구글", "구글드라이브", "구글캘린더"],
+            "server": "@modelcontextprotocol/server-google-maps",
+            "source": "github.com/modelcontextprotocol/servers",
+            "install": "npx -y @modelcontextprotocol/server-google-maps",
+            "env_key": "GOOGLE_MAPS_API_KEY",
+            "description": "Google Maps Platform MCP — 장소 검색, 경로, 지오코딩",
+            "priority": 2,
         },
         "github": {
             "keywords": ["github", "깃허브", "repository", "pull request", "issue"],
@@ -193,10 +212,11 @@ class APIDiscovery:
         """
         Tiered Strategy — 단계별 탐색 전략.
 
+        [최우선] Gmail MCP → Google Maps MCP → Smithery Registry
         Tier 0: 로컬 MCP 프로브 (이미 연결된 서버)
-        Tier 1: 메이저 서비스 공식 MCP 조회 (Official/Standard)
+        Tier 1: Gmail / Google Maps 공식 MCP (항상 최우선 시도)
         Tier 2: MCP 레지스트리 심층 탐색 (Smithery / Awesome-MCP)
-        Tier 3: REST API / pip 라이브러리 폴백
+        Tier 3: REST API / pip 라이브러리 폴백 (웹 검색 — 최후의 수단)
         """
         await _log("system", f"🔍 탐색 시작: '{user_request}'", "[탐색 중...]")
 
@@ -205,18 +225,25 @@ class APIDiscovery:
         if local_mcp:
             return local_mcp
 
-        # ── Tier 1: 메이저 서비스 공식 MCP 조회 ──
+        # ── Tier 1-Priority: Gmail / Google Maps 공식 MCP (최우선) ──
+        # 이메일/지도 관련 요청은 다른 어떤 방법보다 먼저 공식 MCP를 시도한다.
+        priority_result = await self._check_priority_services(user_request)
+        if priority_result:
+            return priority_result
+
+        # ── Tier 1: 기타 메이저 서비스 공식 MCP 조회 ──
         official_mcp = await self._check_official_mcp(user_request)
         if official_mcp:
             return official_mcp
 
         # ── Tier 2: 레지스트리 심층 탐색 (Smithery / Awesome-MCP) ──
+        # Smithery는 웹 검색보다 MCP 서버를 통한 실시간 데이터 접근에 훨씬 유리하다.
         registry_result = await self._search_mcp_registries(user_request)
         if registry_result:
             return registry_result
 
         # ── Tier 2 실패 + SMITHERY_API_KEY 미설정 → 사용자에게 설정 안내 ──
-        # MCP가 웹 검색보다 실시간 데이터에 유리하므로, API 키 설정을 우선 권장
+        # 웹 검색(Tier 3)으로 가기 전에 Smithery 사용을 권장
         if not self.smithery.is_available:
             await _log("system",
                 "🔑 [Smithery API 키 필요] MCP 서버 탐색을 위해 SMITHERY_API_KEY가 필요합니다.\n"
@@ -253,137 +280,288 @@ class APIDiscovery:
         strategy = await self._analyze_with_llm(user_request, all_results)
         return strategy
 
+    # ── Tier 1-Priority: Gmail / Google Maps 최우선 체크 ──────────
+
+    async def _check_priority_services(self, user_request: str) -> dict | None:
+        """
+        Gmail과 Google Maps는 최우선 서비스다.
+        키워드 매칭 없이도 이메일/지도 관련 요청이라면 반드시 먼저 시도한다.
+        """
+        req_lower = user_request.lower()
+
+        # 이메일 관련 힌트
+        email_hints = ["email", "이메일", "메일", "mail", "gmail", "지메일", "받은편지함", "보내기", "send", "inbox", "smtp"]
+        # 지도/장소 관련 힌트
+        map_hints = ["map", "maps", "장소", "위치", "경로", "지도", "맛집", "근처", "주변", "directions", "place", "구글맵", "위도", "경도", "주소"]
+
+        priority_services = []
+        if any(h in req_lower for h in email_hints):
+            priority_services.append("gmail")
+        if any(h in req_lower for h in map_hints):
+            priority_services.append("google_maps")
+
+        if not priority_services:
+            return None
+
+        for service_id in priority_services:
+            info = self._OFFICIAL_MCP_MAP.get(service_id)
+            if not info:
+                continue
+
+            await _log("system",
+                f"⭐ [최우선 서비스] {service_id.upper()} MCP 시도: {info['server']}\n"
+                f"   Gmail/Google Maps는 웹검색보다 항상 우선됩니다.",
+                f"[{service_id.upper()} MCP 시도 중]")
+
+            result = await self._try_official_service(service_id, info, user_request)
+            if result:
+                return result
+
+        return None
+
     # ── Tier 1: 메이저 서비스 공식 MCP ────────────────────────
+
+    async def _try_official_service(self, service_id: str, info: dict, _user_request: str = "") -> dict | None:
+        """단일 공식 MCP 서비스를 시도하는 공통 헬퍼."""
+        env_key = info.get("env_key")
+        auth_needed = env_key is not None
+
+        await _log("system",
+            f"🏛️ [Tier 1] 공식 MCP 서버 발견: {info['server']}\n"
+            f"   서비스: {service_id}\n"
+            f"   출처: {info['source']}\n"
+            f"   설치: {info['install']}\n"
+            f"   인증: {'필요 (' + env_key + ')' if auth_needed else '불필요'}",
+            "[공식 MCP 발견]")
+
+        # ── Step A: Smithery 프록시로 연결 시도 (로컬 설치 불필요) ──
+        if self.smithery.is_available:
+            await _log("system",
+                f"🔌 [Tier 1 → Smithery 프록시] {info['server']}를 Smithery 프록시로 연결 시도...",
+                "[Smithery 프록시 시도]")
+            try:
+                servers = await self.smithery.search_servers(info["server"])
+                if servers:
+                    best = servers[0]
+                    details = await self.smithery.get_server_details(best["qualifiedName"])
+                    if details:
+                        mcp_url = details.get("deploymentUrl") or details.get("mcpUrl") or details.get("url", "")
+                        conn_id = await self.smithery.get_or_create_connection(
+                            best["qualifiedName"],
+                            server_url=mcp_url
+                        )
+                        if conn_id:
+                            tools = await self.smithery.list_tools(conn_id)
+                            await _log("system",
+                                f"✅ [Smithery 프록시 연결 성공] {info['server']} → 프록시 ID: {conn_id[:16]}...\n"
+                                f"   사용 가능 도구: {len(tools or [])}개",
+                                "[Smithery 프록시 성공]")
+                            return {
+                                "strategy": "mcp",
+                                "service_name": info["server"],
+                                "api_endpoint": f"https://api.smithery.ai/connections/{conn_id}/call",
+                                "pip_packages": [],
+                                "auth_required": True,
+                                "env_key_name": "SMITHERY_API_KEY",
+                                "description": info["description"],
+                                "implementation_hint": f"Smithery 프록시를 통해 {info['server']} MCP 서버 호출.",
+                                "smithery_connection_id": conn_id,
+                                "smithery_qualified_name": best["qualifiedName"],
+                                "mcp_tools": tools or details.get("tools", []),
+                                "mcp_registry_source": f"smithery.ai/server/{best['qualifiedName']}",
+                                "mcp_reliability": "high",
+                                "mcp_tier": "official_via_smithery",
+                            }
+            except Exception as e:
+                await _log("system",
+                    f"⚠️ [Smithery 프록시 실패] {e}",
+                    "[Smithery 프록시 실패]")
+
+        # ── Step B: 로컬 MCP 서버 확인 ──
+        local_mcp_url = os.getenv("MCP_SERVER_URL", "http://localhost:8080")
+        if not local_mcp_url.rstrip("/").endswith("/mcp"):
+            local_mcp_url = local_mcp_url.rstrip("/") + "/mcp"
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                resp = await client.post(local_mcp_url, json={
+                    "jsonrpc": "2.0", "method": "tools/list", "params": {}, "id": 1
+                })
+                if resp.status_code == 200:
+                    tools = resp.json().get("result", {}).get("tools", [])
+                    await _log("system",
+                        f"✅ [로컬 MCP 서버 연결 성공] 도구 {len(tools)}개 발견",
+                        "[로컬 MCP 연결]")
+                    return {
+                        "strategy": "mcp",
+                        "service_name": info["server"],
+                        "api_endpoint": "",
+                        "pip_packages": [],
+                        "auth_required": auth_needed,
+                        "env_key_name": env_key,
+                        "description": info["description"],
+                        "implementation_hint": (
+                            f"공식 MCP 서버 {info['server']} 사용. "
+                            f"JSON-RPC tools/list → tools/call 패턴으로 호출."
+                        ),
+                        "mcp_tools": tools,
+                        "mcp_registry_source": info["source"],
+                        "mcp_install_method": info["install"],
+                        "mcp_reliability": "high",
+                        "mcp_tier": "official",
+                    }
+        except Exception:
+            pass  # 로컬 MCP 서버 없음 → Step C로
+
+        # ── Step C: npx 자동 실행 시도 (사용자에게 설치 요청 대신 Agent가 직접 실행) ──
+        install_cmd = info["install"]
+        if install_cmd.startswith("npx"):
+            await _log("system",
+                f"🚀 [Agent 자동 실행] {install_cmd} 직접 시작 중...\n"
+                f"   사장님에게 설치 요청 없이 Agent가 직접 MCP 서버를 탐색합니다.",
+                "[npx 자동 실행]")
+            env_vars = {env_key: os.getenv(env_key, "")} if env_key else {}
+            probe = await self._probe_stdio_mcp(install_cmd, env_vars)
+            if probe:
+                tools_count = len(probe["tools"])
+                tools_names = [t.get("name", "?") for t in probe["tools"][:5]]
+                await _log("system",
+                    f"✅ [npx 자동 실행 성공] {info['server']} — 도구 {tools_count}개 발견\n"
+                    f"   도구 목록: {tools_names}",
+                    "[npx 자동 실행 성공]")
+                return {
+                    "strategy": "subprocess_mcp",
+                    "service_name": info["server"],
+                    "description": info["description"],
+                    "subprocess_cmd": probe["proc_cmd"],
+                    "env_key_name": env_key,
+                    "auth_required": auth_needed,
+                    "mcp_tools": probe["tools"],
+                    "mcp_tier": "official_subprocess",
+                    "mcp_reliability": "high",
+                    "pip_packages": [],
+                    "implementation_hint": (
+                        f"⚠️ 중요 구조 규칙: 반드시 @tool 데코레이터가 붙은 단일 함수 하나만 작성하라. "
+                        f"helper 함수(initialize_mcp 등)를 별도로 만들지 마라 — 모든 로직을 @tool 함수 안에 인라인으로 작성하라.\n"
+                        f"구현 방법: @tool 함수 내부에서 asyncio.create_subprocess_exec({probe['proc_cmd']!r}, "
+                        f"stdin=PIPE, stdout=PIPE, stderr=PIPE, env={{...os.environ, '{env_key}': os.getenv('{env_key}','')}} 로 MCP 서버를 시작. "
+                        f"JSON-RPC 순서: initialize → notifications/initialized → tools/call. "
+                        f"사용 가능 도구: {[t.get('name') for t in probe['tools']]}. "
+                        f"결과는 dict를 반환. 호출 완료 후 반드시 proc.terminate()로 정리.\n"
+                        f"함수 반환값은 반드시 dict 또는 str 이어야 하며, httpx.AsyncClient나 subprocess 객체를 반환하지 마라."
+                    ),
+                }
+            await _log("system",
+                f"⚠️ [npx 자동 실행 실패] {install_cmd} — 사용자에게 설치 안내로 폴백",
+                "[npx 실패 폴백]")
+
+        # ── 최종 폴백: 설치 안내 반환 ──
+        env_hint = f"\n   환경변수: {env_key}" if auth_needed else ""
+        await _log("system",
+            f"📦 [MCP 서버 미설치] {info['server']}가 로컬에 없습니다.\n"
+            f"   설치 명령어: {install_cmd}{env_hint}",
+            "[MCP 설치 필요]")
+
+        return {
+            "strategy": "mcp_install_required",
+            "service_name": info["server"],
+            "description": info["description"],
+            "install_command": install_cmd,
+            "env_key_name": env_key,
+            "auth_required": auth_needed,
+            "source": info["source"],
+            "mcp_tier": "official",
+            "install_guide": (
+                f"📦 **MCP 서버 설치가 필요합니다**\n\n"
+                f"서버: {info['server']}\n"
+                f"설명: {info['description']}\n\n"
+                f"**설치 방법:**\n"
+                f"```\n{install_cmd}\n```\n"
+                + (f"\n**환경변수 설정:**\n`.env` 파일에 `{env_key}=발급받은키` 추가\n" if auth_needed else "")
+                + f"\n설치 후 '설정 완료'라고 알려주세요."
+            ),
+        }
+
+    async def _probe_stdio_mcp(self, install_cmd: str, env_vars: dict) -> dict | None:
+        """
+        npx 명령을 subprocess로 직접 실행하여 stdio JSON-RPC로 MCP 서버를 탐색.
+        사용자에게 설치 요청 대신 Agent가 직접 실행하고 도구 목록을 가져온다.
+        """
+        cmd_parts = install_cmd.split()
+        env = {**os.environ, **{k: v for k, v in env_vars.items() if v}}
+        proc = None
+        try:
+            await _log("system",
+                f"🔧 [stdio MCP 프로브] 명령어: {install_cmd}",
+                "[stdio MCP 시작]")
+            proc = await asyncio.create_subprocess_exec(
+                *cmd_parts,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+
+            # ── Step 1: initialize ──
+            init_msg = json.dumps({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "skill-factory", "version": "1.0"},
+                }
+            }) + "\n"
+            proc.stdin.write(init_msg.encode())
+            await proc.stdin.drain()
+            await asyncio.wait_for(proc.stdout.readline(), timeout=20)  # init response
+
+            # ── Step 2: notifications/initialized ──
+            notif = json.dumps({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {}
+            }) + "\n"
+            proc.stdin.write(notif.encode())
+            await proc.stdin.drain()
+
+            # ── Step 3: tools/list ──
+            list_msg = json.dumps({
+                "jsonrpc": "2.0", "id": 2,
+                "method": "tools/list", "params": {}
+            }) + "\n"
+            proc.stdin.write(list_msg.encode())
+            await proc.stdin.drain()
+            raw = await asyncio.wait_for(proc.stdout.readline(), timeout=10)
+            result = json.loads(raw)
+            tools = result.get("result", {}).get("tools", [])
+
+            return {"proc_cmd": cmd_parts, "tools": tools}
+        except Exception as e:
+            await _log("system", f"⚠️ [stdio MCP 프로브 실패] {e}", "[npx 프로브 실패]")
+            return None
+        finally:
+            if proc and proc.returncode is None:
+                try:
+                    proc.terminate()
+                    await asyncio.wait_for(proc.wait(), timeout=3)
+                except Exception:
+                    pass
 
     async def _check_official_mcp(self, user_request: str) -> dict | None:
         """
         요청 키워드를 기반으로 공식 MCP 표준 서버(modelcontextprotocol/servers)에
         매칭되는 서비스가 있는지 확인. 공식 서버는 보안성이 높고 설정이 표준화되어 있음.
+        Gmail/Google Maps는 _check_priority_services에서 이미 처리됨.
         """
         req_lower = user_request.lower()
+        priority_ids = {"gmail", "google_maps"}  # already handled
 
         for service_id, info in self._OFFICIAL_MCP_MAP.items():
+            if service_id in priority_ids:
+                continue  # skip — already tried in priority phase
             if any(kw in req_lower for kw in info["keywords"]):
-                env_key = info.get("env_key")
-                auth_needed = env_key is not None
-
-                await _log("system",
-                    f"🏛️ [Tier 1] 공식 MCP 서버 발견: {info['server']}\n"
-                    f"   서비스: {service_id}\n"
-                    f"   출처: {info['source']}\n"
-                    f"   설치: {info['install']}\n"
-                    f"   인증: {'필요 (' + env_key + ')' if auth_needed else '불필요'}",
-                    "[공식 MCP 발견]")
-
-                # ── Step A: Smithery 프록시로 연결 시도 (로컬 설치 불필요) ──
-                if self.smithery.is_available:
-                    await _log("system",
-                        f"🔌 [Tier 1 → Smithery 프록시] {info['server']}를 Smithery 프록시로 연결 시도...",
-                        "[Smithery 프록시 시도]")
-                    try:
-                        # Smithery에서 해당 서버 검색
-                        servers = await self.smithery.search_servers(info["server"])
-                        if servers:
-                            best = servers[0]
-                            details = await self.smithery.get_server_details(best["qualifiedName"])
-                            if details:
-                                mcp_url = details.get("deploymentUrl") or details.get("mcpUrl") or details.get("url", "")
-                                conn_id = await self.smithery.get_or_create_connection(
-                                    best["qualifiedName"],
-                                    server_url=mcp_url
-                                )
-                                if conn_id:
-                                    tools = await self.smithery.list_tools(conn_id)
-                                    await _log("system",
-                                        f"✅ [Smithery 프록시 연결 성공] {info['server']} → 프록시 ID: {conn_id[:16]}...\n"
-                                        f"   사용 가능 도구: {len(tools or [])}개",
-                                        "[Smithery 프록시 성공]")
-                                    return {
-                                        "strategy": "mcp",
-                                        "service_name": info["server"],
-                                        "api_endpoint": f"https://api.smithery.ai/connections/{conn_id}/call",
-                                        "pip_packages": [],
-                                        "auth_required": True,
-                                        "env_key_name": "SMITHERY_API_KEY",
-                                        "description": info["description"],
-                                        "implementation_hint": f"Smithery 프록시를 통해 {info['server']} MCP 서버 호출.",
-                                        "smithery_connection_id": conn_id,
-                                        "smithery_qualified_name": best["qualifiedName"],
-                                        "mcp_tools": tools or details.get("tools", []),
-                                        "mcp_registry_source": f"smithery.ai/server/{best['qualifiedName']}",
-                                        "mcp_reliability": "high",
-                                        "mcp_tier": "official_via_smithery",
-                                    }
-                    except Exception as e:
-                        await _log("system",
-                            f"⚠️ [Smithery 프록시 실패] {e}",
-                            "[Smithery 프록시 실패]")
-
-                # ── Step B: 로컬 MCP 서버 확인 ──
-                local_mcp_url = os.getenv("MCP_SERVER_URL", "http://localhost:8080")
-                if not local_mcp_url.rstrip("/").endswith("/mcp"):
-                    local_mcp_url = local_mcp_url.rstrip("/") + "/mcp"
-                try:
-                    async with httpx.AsyncClient(timeout=3.0) as client:
-                        resp = await client.post(local_mcp_url, json={
-                            "jsonrpc": "2.0", "method": "tools/list", "params": {}, "id": 1
-                        })
-                        if resp.status_code == 200:
-                            tools = resp.json().get("result", {}).get("tools", [])
-                            await _log("system",
-                                f"✅ [로컬 MCP 서버 연결 성공] 도구 {len(tools)}개 발견",
-                                "[로컬 MCP 연결]")
-                            return {
-                                "strategy": "mcp",
-                                "service_name": info["server"],
-                                "api_endpoint": "",
-                                "pip_packages": [],
-                                "auth_required": auth_needed,
-                                "env_key_name": env_key,
-                                "description": info["description"],
-                                "implementation_hint": (
-                                    f"공식 MCP 서버 {info['server']} 사용. "
-                                    f"JSON-RPC tools/list → tools/call 패턴으로 호출."
-                                ),
-                                "mcp_tools": tools,
-                                "mcp_registry_source": info["source"],
-                                "mcp_install_method": info["install"],
-                                "mcp_reliability": "high",
-                                "mcp_tier": "official",
-                            }
-                except Exception:
-                    pass  # 로컬 MCP 서버 없음 → Step C로
-
-                # ── Step C: MCP 서버 설치 안내 ──
-                # Smithery도 안 되고, 로컬에도 없으면 → 사용자에게 설치 유도
-                install_cmd = info["install"]
-                env_hint = f"\n   환경변수: {env_key}" if auth_needed else ""
-
-                await _log("system",
-                    f"📦 [MCP 서버 미설치] {info['server']}가 로컬에 없습니다.\n"
-                    f"   설치 명령어: {install_cmd}{env_hint}\n"
-                    f"   → 사장님에게 설치 안내를 전달합니다.",
-                    "[MCP 설치 필요]")
-
-                return {
-                    "strategy": "mcp_install_required",
-                    "service_name": info["server"],
-                    "description": info["description"],
-                    "install_command": install_cmd,
-                    "env_key_name": env_key,
-                    "auth_required": auth_needed,
-                    "source": info["source"],
-                    "mcp_tier": "official",
-                    "install_guide": (
-                        f"📦 **MCP 서버 설치가 필요합니다**\n\n"
-                        f"서버: {info['server']}\n"
-                        f"설명: {info['description']}\n\n"
-                        f"**설치 방법:**\n"
-                        f"```\n{install_cmd}\n```\n"
-                        + (f"\n**환경변수 설정:**\n`.env` 파일에 `{env_key}=발급받은키` 추가\n" if auth_needed else "")
-                        + f"\n설치 후 '설정 완료'라고 알려주세요."
-                    ),
-                }
+                result = await self._try_official_service(service_id, info, user_request)
+                if result:
+                    return result
 
         return None
 
@@ -808,7 +986,83 @@ class CodeSynthesizer:
     @staticmethod
     def _format_mcp_tools_context(strategy: dict) -> str:
         """MCP 전략일 때 도구 목록 또는 외부 레지스트리 정보를 프롬프트에 주입."""
-        if strategy.get("strategy") != "mcp":
+        strat = strategy.get("strategy")
+
+        # subprocess_mcp 전략: stdio JSON-RPC 패턴 주입
+        if strat == "subprocess_mcp":
+            cmd = strategy.get("subprocess_cmd", [])
+            env_key = strategy.get("env_key_name") or ""
+            mcp_tools = strategy.get("mcp_tools", [])
+            tools_text = json.dumps(mcp_tools, ensure_ascii=False, indent=2)
+            return f"""
+## ⚠️ subprocess_mcp 전략 — stdio JSON-RPC 패턴 (CRITICAL)
+
+이 MCP 서버는 **stdio(stdin/stdout) 기반** 프로세스다.
+HTTP 클라이언트(httpx) 절대 사용 금지. 반드시 아래 패턴으로만 구현하라.
+
+### 사용 가능한 도구 목록
+```json
+{tools_text}
+```
+
+### 완전한 구현 패턴 (이 구조를 그대로 사용하라)
+```python
+from __future__ import annotations
+import os, asyncio, json
+from asyncio import subprocess as asp
+from core.executor import tool
+
+@tool
+async def YOUR_FUNCTION_NAME(param1: str, param2: str = "") -> dict:
+    \"\"\"Docstring here.\"\"\"
+    api_key = os.getenv("{env_key or 'YOUR_ENV_KEY'}", "")
+    cmd = {cmd!r}
+    env = {{**os.environ{f', "{env_key}": api_key' if env_key else ''}}}
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=asp.PIPE, stdout=asp.PIPE, stderr=asp.PIPE,
+        env=env,
+    )
+    try:
+        # 1) initialize
+        init = json.dumps({{"jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{{"protocolVersion":"2024-11-05","capabilities":{{}},
+                       "clientInfo":{{"name":"agent","version":"1.0"}}}}}}) + "\\n"
+        proc.stdin.write(init.encode()); await proc.stdin.drain()
+        await asyncio.wait_for(proc.stdout.readline(), timeout=20)
+
+        # 2) notifications/initialized
+        notif = json.dumps({{"jsonrpc":"2.0","method":"notifications/initialized","params":{{}}}}) + "\\n"
+        proc.stdin.write(notif.encode()); await proc.stdin.drain()
+
+        # 3) tools/call
+        call = json.dumps({{"jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{{"name":"maps_search_places",  # 도구 목록에서 선택
+                       "arguments":{{"query": param1}}}}}}) + "\\n"
+        proc.stdin.write(call.encode()); await proc.stdin.drain()
+        raw = await asyncio.wait_for(proc.stdout.readline(), timeout=15)
+        data = json.loads(raw)
+        content = data.get("result", {{}}).get("content", [])
+        texts = [c["text"] for c in content if c.get("type") == "text"]
+        return {{"결과": "\\n".join(texts)}} if texts else {{"결과": str(data)}}
+    except Exception as e:
+        return {{"error": str(e), "detail": "stdio MCP 통신 실패"}}
+    finally:
+        if proc.returncode is None:
+            proc.terminate()
+            try: await asyncio.wait_for(proc.wait(), timeout=3)
+            except Exception: pass
+```
+
+### 핵심 규칙
+1. **httpx 절대 사용 금지** — HTTP 클라이언트가 아닌 stdio 프로세스임
+2. **import httpx 작성 금지** — 이 스킬에는 httpx가 필요 없음
+3. initialize → notifications/initialized → tools/call 순서 필수
+4. proc.terminate() 반드시 finally 블록에서 호출
+5. 반환값은 dict — subprocess 객체나 coroutine 절대 반환 금지
+"""
+
+        if strat != "mcp":
             return ""
 
         mcp_tools = strategy.get("mcp_tools")
@@ -986,7 +1240,7 @@ async with httpx.AsyncClient(timeout=15.0) as client:
 {correction_section}
 
 ## 코드 생성 규칙
-1. **반드시 `async def` 함수로 작성** (httpx.AsyncClient 사용)
+1. **반드시 `async def` 함수로 작성** {"(httpx.AsyncClient 사용)" if strategy.get("strategy") != "subprocess_mcp" else "(asyncio.create_subprocess_exec 사용 — httpx 절대 금지)"}
 2. **`from core.executor import tool` import 후 `@tool` 데코레이터 적용**
 3. **Google-style Docstring 필수** (Args:, Returns: 섹션 포함)
 4. 환경변수는 `os.getenv("ENV_KEY_NAME")` 로만 읽기 (하드코딩 절대 금지)
@@ -996,6 +1250,8 @@ async with httpx.AsyncClient(timeout=15.0) as client:
 8. `from __future__ import annotations` 포함
 9. pip 패키지가 필요한 경우 주석으로 설치 명령 명시
 10. **민감 정보(API 키, 토큰)는 절대 코드에 노출 금지** — os.getenv() 전용
+11. **⚠️ 반환값 필수 규칙**: 함수는 반드시 `dict` 또는 `str`을 반환해야 한다. `httpx.AsyncClient`, subprocess, coroutine 등 비직렬화 객체를 반환하면 안 된다.
+12. **⚠️ 단일 @tool 함수 원칙**: 파일에 `@tool` 함수는 반드시 하나만 작성. helper 함수(`initialize_*`, `create_client` 등)가 필요하면 `@tool` 함수 BODY 안에 인라인으로 작성하거나 중첩 함수로 정의.
 
 ## 범용화 원칙 (Generalization Protocol) — 반드시 준수
 ### 1. Parameterization First (파라미터화 우선)
@@ -1011,7 +1267,7 @@ async with httpx.AsyncClient(timeout=15.0) as client:
 - 나쁜 예: `get_available_restaurants_near_aewol`, `search_seoul_cafes`, `find_starbucks_locations`
 - 좋은 예: `search_nearby_restaurants`, `search_local_cafes`, `find_store_locations`
 
-## MCP 전략 구현 시 반드시 준수 (CRITICAL — strategy가 "mcp"인 경우)
+{"## ⛔ subprocess_mcp 전략 주의 (CRITICAL)" + chr(10) + "이 스킬은 subprocess_mcp 전략입니다. 위의 ## ⚠️ subprocess_mcp 전략 섹션의 패턴만 사용하세요." + chr(10) + "httpx, MCP_SERVER_URL, HTTP POST 등은 절대 사용하지 마세요. 위의 stdio 패턴이 유일한 올바른 구현입니다." if strategy.get("strategy") == "subprocess_mcp" else """## MCP 전략 구현 시 반드시 준수 (CRITICAL — strategy가 "mcp"인 경우)
 MCP(Model Context Protocol) 서버와 통신할 때는 **절대로 일반 REST API(GET/POST)를 사용하지 마라**.
 반드시 아래의 **JSON-RPC 프로토콜**을 사용해야 한다.
 
@@ -1069,7 +1325,38 @@ async with httpx.AsyncClient(timeout=15.0) as client:
 - ❌ `httpx.get(url, params=...)` 같은 일반 REST 호출
 - ❌ MCP_SERVER_URL에 직접 쿼리 파라미터를 붙이는 것
 - ❌ 존재하지 않는 API 엔드포인트를 추측으로 만드는 것
-- ❌ `/api/restaurants`, `/api/weather` 같은 경로를 임의로 만드는 것
+- ❌ `/api/restaurants`, `/api/weather` 같은 경로를 임의로 만드는 것"""}
+
+## ⛔ 데이터 조작 절대 금지 (CRITICAL — 가장 중요한 규칙)
+생성하는 스킬 코드는 **절대로 가짜 데이터, placeholder, 예시 데이터를 반환하면 안 된다.**
+
+### 금지 패턴
+```python
+# ❌ 절대 금지 — API 실패 시 샘플 데이터 반환
+except Exception:
+    return {{"places": [{{"name": "XX 카페", "desc": "편안한 분위기"}}]}}  # ← 데이터 날조
+
+# ❌ 절대 금지 — 빈 결과를 가짜로 채우기
+if not results:
+    results = [{{"name": "추천 장소 1"}}]  # ← 없는 데이터를 만들어냄
+
+# ❌ 절대 금지 — 오류를 숨기고 기본값 반환
+except Exception as e:
+    return {{"결과": "검색 결과입니다."}}  # ← 오류 은폐
+```
+
+### 올바른 패턴 (반드시 이렇게 작성)
+```python
+# ✅ 오류 시 오류 사실만 정직하게 반환
+except Exception as e:
+    return {{"error": str(e), "detail": "데이터를 가져오지 못했습니다. 실제 결과 없음."}}
+
+# ✅ 빈 결과도 정직하게 반환
+if not results:
+    return {{"결과없음": True, "detail": f"'{{query}}'에 대한 검색 결과가 없습니다."}}
+```
+
+**이 규칙을 어기면 사용자가 존재하지 않는 장소·정보를 믿고 행동할 수 있어 심각한 피해가 발생한다.**
 
 ## 이메일 전송 구현 시 반드시 준수 (CRITICAL)
 이메일 전송 함수의 파라미터명은 **반드시 아래와 같이 정확히 사용**해야 합니다:
@@ -1300,7 +1587,18 @@ class SandboxExecutor:
             Path(tmp_path).unlink(missing_ok=True)
 
     def _extract_function_name(self, code: str) -> str | None:
-        for line in code.split("\n"):
+        lines = code.split("\n")
+        # 우선순위 1: @tool 데코레이터 바로 다음의 함수명을 반환
+        for i, line in enumerate(lines):
+            if "@tool" in line.strip():
+                for j in range(i + 1, min(i + 4, len(lines))):
+                    nxt = lines[j].strip()
+                    if nxt.startswith("async def ") or nxt.startswith("def "):
+                        name = nxt.split("def ")[1].split("(")[0].strip()
+                        if name not in ("tool", "main"):
+                            return name
+        # 폴백: 첫 번째 함수명
+        for line in lines:
             line = line.strip()
             if line.startswith("async def ") or line.startswith("def "):
                 name = line.split("def ")[1].split("(")[0].strip()
@@ -1688,6 +1986,40 @@ class SkillFactory:
                         pass
 
                 previous_error = error_msg
+
+                # ── ModuleNotFoundError: 자동 pip 설치 후 즉시 재시도 ──
+                import re as _re
+                missing_mod = _re.search(r"No module named '([\w\.\-]+)'", error_msg)
+                if missing_mod:
+                    pkg = missing_mod.group(1).split(".")[0]  # e.g. "google.maps" → "google"
+                    await _log("system",
+                        f"⚙️ [자동 pip 설치] '{pkg}' 패키지 자동 설치 중...",
+                        "[패키지 자동 설치]")
+                    try:
+                        pip_proc = await asyncio.create_subprocess_exec(
+                            sys.executable, "-m", "pip", "install", pkg, "-q",
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        await asyncio.wait_for(pip_proc.wait(), timeout=60)
+                        await _log("system",
+                            f"✅ '{pkg}' 설치 완료 — 재실행 중...",
+                            "[패키지 자동 설치 완료]")
+                        # 즉시 재실행 (attempt 카운트 소비 없이)
+                        exec_result = await self.sandbox.execute(code, test_args)
+                        if exec_result["success"]:
+                            await _log("system",
+                                f"✅ 패키지 설치 후 실행 성공!",
+                                "[실행 성공]")
+                            break
+                        else:
+                            error_msg = exec_result["error"] or ""
+                            previous_error = error_msg
+                    except Exception as pip_e:
+                        await _log("system",
+                            f"⚠️ '{pkg}' 자동 설치 실패: {pip_e}",
+                            "[패키지 설치 실패]")
+
                 # 환경 피드백 수집 (반복적 프롬프팅의 핵심)
                 env_feedback = self.sandbox.collect_env_feedback(code, error_msg)
                 if env_feedback:

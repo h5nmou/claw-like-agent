@@ -32,7 +32,18 @@ class Brain:
         self._messages.append({"role": "user", "content": content})
 
     def add_tool_result(self, tool_call_id: str, result: Any) -> None:
-        result_str = json.dumps(result, ensure_ascii=False) if not isinstance(result, str) else result
+        if isinstance(result, str):
+            result_str = result
+        else:
+            try:
+                result_str = json.dumps(result, ensure_ascii=False)
+            except (TypeError, ValueError):
+                # 비직렬화 객체(httpx.AsyncClient 등) → 오류 메시지로 변환
+                result_str = json.dumps({
+                    "error": "TOOL_RETURNED_NON_SERIALIZABLE",
+                    "type": type(result).__name__,
+                    "detail": f"스킬이 JSON으로 직렬화할 수 없는 객체({type(result).__name__})를 반환했습니다. 스킬 코드를 확인하세요.",
+                }, ensure_ascii=False)
         self._messages.append({
             "role": "tool",
             "tool_call_id": tool_call_id,
