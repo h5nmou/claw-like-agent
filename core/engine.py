@@ -628,6 +628,7 @@ async def run_agent_loop(trigger_event: dict) -> dict:
                 f"1. reload_env 호출하여 새 환경변수 로드\n"
                 f"2. 이전에 중단된 STEP부터 재개 (Priority Ladder 순서 준수)\n"
                 f"3. 모든 STEP 완료 후 결과를 send_telegram_message로 사장님에게 보고\n"
+                f"4. ⚠️ **반드시** propose_care_automation을 호출하여 사장님에게 자동화 등록 여부를 질문하세요 (STEP 5 필수)\n"
                 f"사용자에게 정보를 다시 요청하지 마세요. 위의 제안 정보에 모든 내용이 있습니다."
             )
             # proposals 원본도 이벤트에 추가
@@ -662,6 +663,7 @@ async def run_agent_loop(trigger_event: dict) -> dict:
                 f"   - to_email: {_pe.get('to_email')}\n"
                 f"   - subject: {_pe.get('subject')}\n"
                 f"   - body: {str(_pe.get('body', ''))[:200]}\n"
+                f"4. ⚠️ 이메일 전송 완료 후 **반드시** propose_care_automation을 호출하여 사장님에게 자동화 등록 여부를 질문하세요 (STEP 5 필수)\n"
                 f"사용자에게 정보를 다시 요청하지 마세요."
             )
             await broadcaster.emit("system",
@@ -699,6 +701,24 @@ async def run_agent_loop(trigger_event: dict) -> dict:
             f"사장님이 환경변수(SMTP 비밀번호 등) 설정을 완료했다고 합니다.\n"
             f"1. 먼저 `reload_env`를 호출하여 새 환경변수를 로드하세요.\n"
             f"2. 로드 완료 후, 사장님에게 '환경변수가 정상적으로 로드되었습니다. 이전에 중단된 작업이 있으면 다시 요청해 주세요.'라고 안내하세요.\n"
+        )
+
+    # ── 숙소 위경도 컨텍스트 주입 (장소 검색 스킬에 직접 전달용) ──
+    _prop_lat = trigger_event.get("lat") or trigger_event.get("property_lat")
+    _prop_lng = trigger_event.get("lng") or trigger_event.get("property_lng")
+    # booking 이벤트의 경우 booking 객체 안에 있을 수 있음
+    if not _prop_lat:
+        _booking = trigger_event.get("booking", {})
+        _prop_lat = _booking.get("property_lat")
+        _prop_lng = _booking.get("property_lng")
+    _coords_context = ""
+    if _prop_lat and _prop_lng:
+        _coords_context = (
+            f"\n\n📍 **[숙소 위경도 — 장소 검색 시 반드시 이 값을 사용하세요]**\n"
+            f"latitude: {_prop_lat}\n"
+            f"longitude: {_prop_lng}\n"
+            f"⚠️ 주소 문자열(예: '제주도 애월읍')을 위경도로 변환하려 하지 마세요. "
+            f"위 좌표를 그대로 스킬 파라미터에 넣으세요.\n"
         )
 
     # ── Proactive Care 컨텍스트 주입 ──
@@ -746,6 +766,7 @@ async def run_agent_loop(trigger_event: dict) -> dict:
     trigger_text = (
         f"다음 이벤트가 발생했습니다. 적절한 조치를 취해주세요.\n\n"
         f"```json\n{json.dumps(trigger_event, ensure_ascii=False, indent=2)}\n```"
+        f"{_coords_context}"
         f"{pending_context}"
         f"{care_context}"
         f"{_suppress_tg}"

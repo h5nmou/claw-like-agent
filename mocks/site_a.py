@@ -29,6 +29,8 @@ ENGINE_WEBHOOK_URL = os.getenv("ENGINE_WEBHOOK_URL", "http://localhost:8000/webh
 
 # ── 숙소 위치 설정 ──────────────────────────────────
 PROPERTY_LOCATION = "제주도 애월읍"
+PROPERTY_LAT = 33.410571
+PROPERTY_LNG = 126.393147
 
 # ── 데이터 모델 ──────────────────────────────────────
 
@@ -127,6 +129,8 @@ async def send_webhook(event_type: str, booking: Booking) -> None:
             "room_id": booking.room_id,
             "check_in": booking.check_in,
             "check_out": booking.check_out,
+            "property_lat": PROPERTY_LAT,
+            "property_lng": PROPERTY_LNG,
         },
     }
     try:
@@ -147,6 +151,8 @@ async def send_weather_webhook(
         "event": "weather_changed",
         "source": "site_a",
         "location": PROPERTY_LOCATION,
+        "lat": PROPERTY_LAT,
+        "lng": PROPERTY_LNG,
         "weather": {
             "previous": old_condition,
             "current": new_condition,

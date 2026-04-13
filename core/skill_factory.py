@@ -138,16 +138,11 @@ class APIDiscovery:
     # ── 메이저 서비스 → 공식 MCP 매핑 ──────────────────────────
     # Google, Slack, GitHub 등 공식/표준 MCP 서버가 존재하는 서비스 목록.
     # modelcontextprotocol/servers 공식 레포 기준.
+    # 정책:
+    # - 실시간성이 중요한 장소 검색(google_maps 등) → MCP 우선
+    # - Gmail 전송은 MCP가 아닌 간단한 SMTP Canonical Template으로 처리
+    #   (OAuth 복잡성 회피, 앱 비밀번호만으로 즉시 동작)
     _OFFICIAL_MCP_MAP: dict[str, dict] = {
-        "gmail": {
-            "keywords": ["gmail", "email", "이메일", "메일", "지메일", "mail", "send email", "receive email", "받은편지함"],
-            "server": "@modelcontextprotocol/server-gmail",
-            "source": "github.com/modelcontextprotocol/servers",
-            "install": "npx -y @modelcontextprotocol/server-gmail",
-            "env_key": "GMAIL_OAUTH_CREDENTIALS",
-            "description": "Gmail MCP — 이메일 전송, 읽기, 검색, 라벨 관리",
-            "priority": 1,
-        },
         "google_maps": {
             "keywords": ["map", "maps", "google maps", "장소", "위치", "경로", "지도", "맛집", "근처", "주변", "geocode", "directions", "place search", "구글맵", "구글지도", "위도", "경도"],
             "server": "@modelcontextprotocol/server-google-maps",
@@ -212,11 +207,12 @@ class APIDiscovery:
         """
         Tiered Strategy — 단계별 탐색 전략.
 
-        [최우선] Gmail MCP → Google Maps MCP → Smithery Registry
+        [최우선] Google Maps MCP (실시간 장소 검색) → Smithery Registry
         Tier 0: 로컬 MCP 프로브 (이미 연결된 서버)
-        Tier 1: Gmail / Google Maps 공식 MCP (항상 최우선 시도)
+        Tier 1: Google Maps 등 공식 MCP (실시간 장소 검색에 필수)
         Tier 2: MCP 레지스트리 심층 탐색 (Smithery / Awesome-MCP)
         Tier 3: REST API / pip 라이브러리 폴백 (웹 검색 — 최후의 수단)
+        ※ Gmail 전송은 MCP가 아닌 SMTP Canonical Template으로 별도 처리됨.
         """
         await _log("system", f"🔍 탐색 시작: '{user_request}'", "[탐색 중...]")
 
@@ -225,8 +221,8 @@ class APIDiscovery:
         if local_mcp:
             return local_mcp
 
-        # ── Tier 1-Priority: Gmail / Google Maps 공식 MCP (최우선) ──
-        # 이메일/지도 관련 요청은 다른 어떤 방법보다 먼저 공식 MCP를 시도한다.
+        # ── Tier 1-Priority: Google Maps 공식 MCP (실시간 장소 검색 최우선) ──
+        # 장소/맛집/경로 등 실시간성이 중요한 요청은 MCP를 가장 먼저 시도한다.
         priority_result = await self._check_priority_services(user_request)
         if priority_result:
             return priority_result
@@ -280,23 +276,22 @@ class APIDiscovery:
         strategy = await self._analyze_with_llm(user_request, all_results)
         return strategy
 
-    # ── Tier 1-Priority: Gmail / Google Maps 최우선 체크 ──────────
+    # ── Tier 1-Priority: 실시간 장소 검색(Google Maps) 최우선 체크 ──────────
 
     async def _check_priority_services(self, user_request: str) -> dict | None:
         """
-        Gmail과 Google Maps는 최우선 서비스다.
-        키워드 매칭 없이도 이메일/지도 관련 요청이라면 반드시 먼저 시도한다.
+        실시간성이 중요한 장소 기반 요청은 Google Maps MCP를 최우선으로 시도한다.
+        이메일(Gmail) 요청은 MCP가 아닌 SMTP Canonical Template으로 처리되므로
+        여기서는 다루지 않는다(create_skill 맨 앞의 _handle_email_skill이 담당).
         """
         req_lower = user_request.lower()
 
-        # 이메일 관련 힌트
-        email_hints = ["email", "이메일", "메일", "mail", "gmail", "지메일", "받은편지함", "보내기", "send", "inbox", "smtp"]
-        # 지도/장소 관련 힌트
-        map_hints = ["map", "maps", "장소", "위치", "경로", "지도", "맛집", "근처", "주변", "directions", "place", "구글맵", "위도", "경도", "주소"]
+        # 지도/장소 관련 힌트 (실시간 데이터 필수)
+        map_hints = ["map", "maps", "장소", "위치", "경로", "지도", "맛집", "근처", "주변",
+                     "directions", "place", "구글맵", "위도", "경도", "주소", "핫플",
+                     "관광", "카페", "여행", "가이드"]
 
         priority_services = []
-        if any(h in req_lower for h in email_hints):
-            priority_services.append("gmail")
         if any(h in req_lower for h in map_hints):
             priority_services.append("google_maps")
 
@@ -310,7 +305,7 @@ class APIDiscovery:
 
             await _log("system",
                 f"⭐ [최우선 서비스] {service_id.upper()} MCP 시도: {info['server']}\n"
-                f"   Gmail/Google Maps는 웹검색보다 항상 우선됩니다.",
+                f"   장소 검색은 실시간성이 중요하므로 MCP를 항상 우선 사용합니다.",
                 f"[{service_id.upper()} MCP 시도 중]")
 
             result = await self._try_official_service(service_id, info, user_request)
@@ -443,7 +438,8 @@ class APIDiscovery:
                         f"⚠️ 중요 구조 규칙: 반드시 @tool 데코레이터가 붙은 단일 함수 하나만 작성하라. "
                         f"helper 함수(initialize_mcp 등)를 별도로 만들지 마라 — 모든 로직을 @tool 함수 안에 인라인으로 작성하라.\n"
                         f"구현 방법: @tool 함수 내부에서 asyncio.create_subprocess_exec({probe['proc_cmd']!r}, "
-                        f"stdin=PIPE, stdout=PIPE, stderr=PIPE, env={{...os.environ, '{env_key}': os.getenv('{env_key}','')}} 로 MCP 서버를 시작. "
+                        f"stdin=PIPE, stdout=PIPE, stderr=PIPE, "
+                        f"env={{...os.environ, 'GOOGLE_MAPS_API_KEY': os.getenv('GOOGLE_MAPS_API_KEY','')}} 로 MCP 서버를 시작. "
                         f"JSON-RPC 순서: initialize → notifications/initialized → tools/call. "
                         f"사용 가능 도구: {[t.get('name') for t in probe['tools']]}. "
                         f"결과는 dict를 반환. 호출 완료 후 반드시 proc.terminate()로 정리.\n"
@@ -550,10 +546,11 @@ class APIDiscovery:
         """
         요청 키워드를 기반으로 공식 MCP 표준 서버(modelcontextprotocol/servers)에
         매칭되는 서비스가 있는지 확인. 공식 서버는 보안성이 높고 설정이 표준화되어 있음.
-        Gmail/Google Maps는 _check_priority_services에서 이미 처리됨.
+        Google Maps는 _check_priority_services에서 이미 처리됨.
+        Gmail은 _handle_email_skill(SMTP Canonical Template)에서 처리됨.
         """
         req_lower = user_request.lower()
-        priority_ids = {"gmail", "google_maps"}  # already handled
+        priority_ids = {"google_maps"}  # already handled in priority phase
 
         for service_id, info in self._OFFICIAL_MCP_MAP.items():
             if service_id in priority_ids:
@@ -1043,8 +1040,16 @@ async def YOUR_FUNCTION_NAME(param1: str, param2: str = "") -> dict:
         raw = await asyncio.wait_for(proc.stdout.readline(), timeout=15)
         data = json.loads(raw)
         content = data.get("result", {{}}).get("content", [])
-        texts = [c["text"] for c in content if c.get("type") == "text"]
-        return {{"결과": "\\n".join(texts)}} if texts else {{"결과": str(data)}}
+        # ⚠️ content[].text는 JSON 문자열인 경우가 많음 — 반드시 json.loads()로 파싱
+        parsed = None
+        for c in content:
+            if c.get("type") == "text" and c.get("text"):
+                try:
+                    parsed = json.loads(c["text"])
+                    break
+                except (json.JSONDecodeError, ValueError):
+                    parsed = c["text"]  # 일반 텍스트면 원본 유지
+        return {{"결과": parsed}} if parsed is not None else {{"결과없음": True, "detail": str(data)}}
     except Exception as e:
         return {{"error": str(e), "detail": "stdio MCP 통신 실패"}}
     finally:
@@ -1060,6 +1065,64 @@ async def YOUR_FUNCTION_NAME(param1: str, param2: str = "") -> dict:
 3. initialize → notifications/initialized → tools/call 순서 필수
 4. proc.terminate() 반드시 finally 블록에서 호출
 5. 반환값은 dict — subprocess 객체나 coroutine 절대 반환 금지
+
+### ⚠️ MCP 응답 파싱 규칙 (CRITICAL — 이 부분을 틀리면 스킬이 무조건 실패)
+MCP 서버의 `tools/call` 응답은 **항상** 다음 구조다:
+```json
+{{"result": {{"content": [{{"type": "text", "text": "<JSON 문자열>"}}]}}}}
+```
+
+- `content[].text`는 **일반 텍스트가 아니라 JSON 문자열인 경우가 대부분**이다.
+- 예: `maps_geocode` 응답 text = `'{{"location": {{"lat": 33.41, "lng": 126.39}}, "formatted_address": "..."}}' `
+- **반드시 `json.loads(text)`로 파싱한 후 필드를 추출하라.**
+- `item.get("type") == "geo"`, `item["places"]` 같은 **존재하지 않는 키를 추측하지 마라** — content 항목의 타입은 `text`뿐이다.
+
+❌ 금지:
+```python
+for item in content:
+    if item.get("type") == "geo":  # ← 이런 타입은 존재하지 않음
+        coords = item["latitude"]
+```
+
+✅ 올바름:
+```python
+for item in content:
+    if item.get("type") == "text":
+        try:
+            parsed = json.loads(item["text"])
+            # parsed가 list일 수도, dict일 수도 있음
+            if isinstance(parsed, list) and parsed: parsed = parsed[0]
+            loc = (parsed or {{}}).get("location") or {{}}
+            lat, lng = loc.get("lat"), loc.get("lng")
+        except json.JSONDecodeError:
+            pass
+```
+
+### ⚠️ 좌표 파라미터 Type-Resilient 처리 (Google Maps MCP 한정)
+`location` 파라미터가 함수 입력으로 들어올 때, 다음 세 가지 형태를 **모두 방어적으로 처리**해야 한다:
+1. `latitude=33.41, longitude=126.39` (별도 float 파라미터)
+2. `location={{"latitude": 33.41, "longitude": 126.39}}` (dict)
+3. `location="제주도 애월읍"` (문자열 — 이때만 geocoding 필요)
+
+**이미 좌표가 있으면 geocoding을 절대 호출하지 마라** — Google Maps는 한국어 주소에서 ZERO_RESULTS를 자주 반환한다.
+
+```python
+# ✅ 입력 판별 패턴
+lat = lng = None
+if latitude is not None and longitude is not None:
+    lat, lng = float(latitude), float(longitude)
+elif isinstance(location, dict):
+    lat = location.get("latitude") or location.get("lat")
+    lng = location.get("longitude") or location.get("lng")
+    if lat is not None and lng is not None:
+        lat, lng = float(lat), float(lng)
+# 좌표가 여전히 없으면 그때만 문자열 → geocoding
+if lat is None and isinstance(location, str) and location.strip():
+    # maps_geocode 호출 후 _parse_mcp_text_content로 lat/lng 추출
+    ...
+
+# maps_search_places 호출 시 location 파라미터는 {{"latitude": lat, "longitude": lng}} 객체
+```
 """
 
         if strat != "mcp":
@@ -1326,6 +1389,194 @@ async with httpx.AsyncClient(timeout=15.0) as client:
 - ❌ MCP_SERVER_URL에 직접 쿼리 파라미터를 붙이는 것
 - ❌ 존재하지 않는 API 엔드포인트를 추측으로 만드는 것
 - ❌ `/api/restaurants`, `/api/weather` 같은 경로를 임의로 만드는 것"""}
+
+## 🏭 Skill Factory Manufacturing Standard (제조 표준 — 반드시 모든 항목 준수)
+
+### 1) MCP Response Handling + Robust Extraction (MCP 응답 처리·견고한 파싱)
+MCP 도구의 결과는 **항상 리스트 형태**로 반환된다: `[{{"type": "text", "text": "<JSON 문자열>"}}]`.
+단, `text` 앞뒤에 설명 문구나 공백이 붙어있는 경우가 있으므로 **순수 JSON 덩어리만 추출**하는 방어 파싱을 반드시 포함하라.
+
+```python
+import re
+content = data.get("result", {{}}).get("content", [])
+parsed = None
+if content and isinstance(content, list):
+    text = content[0].get("text", "") if isinstance(content[0], dict) else ""
+    if text:
+        text = text.strip()
+        # 1차 시도: 그대로 json.loads
+        try:
+            parsed = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            # 2차 시도: JSON 덩어리만 추출 (설명 문구가 섞여있을 때)
+            m = re.search(r"(\\[.*\\]|\\{{.*\\}})", text, re.DOTALL)  # [ ] 또는 {{ }} 블록
+            if m:
+                try:
+                    parsed = json.loads(m.group(1))
+                except (json.JSONDecodeError, ValueError):
+                    parsed = text
+            else:
+                parsed = text
+```
+- `content[0]["text"]`는 대부분 **JSON 문자열** → `json.loads()` 필수
+- JSON 앞뒤에 자연어가 붙어있을 수 있음 → `re.search(r"(\\[...\\]|\\{{...\\}})", ..., re.DOTALL)`로 JSON 블록만 추출 후 재파싱
+- 존재하지 않는 타입(`"geo"`, `"places"` 등)을 가정하지 마라 — content 타입은 대부분 `"text"` 하나다
+
+### 2) Input Type Resilience + Flexible Types (다형 입력 방어)
+모든 파라미터는 `isinstance()`로 타입을 먼저 확인하라. 호출자마다 포맷이 다를 수 있다.
+
+**2-a) location 파라미터 (문자열 주소 vs 좌표 객체)**
+```python
+if isinstance(location, str):
+    # 주소 문자열 → maps_geocode 호출
+    ...
+elif isinstance(location, dict):
+    # 좌표 객체 → geocoding 건너뛰고 직접 사용
+    lat = location.get("latitude") or location.get("lat")
+    lng = location.get("longitude") or location.get("lng")
+```
+- 별도 `latitude: float = None, longitude: float = None` 파라미터도 추가해 직접 좌표 경로 허용
+- **좌표가 이미 있으면 geocoding 호출 금지** (한국어 주소는 ZERO_RESULTS 위험)
+
+**2-b) 키워드/카테고리 파라미터 (문자열 자동 분리)**
+```python
+# ✅ str로 들어오면 ',' 로만 분리. 공백은 절대 분리 기준으로 쓰지 마라!
+#    "실내 관광지" 같이 공백이 포함된 단일 구절이 두 개로 쪼개지면 검색이 망가진다.
+if isinstance(keywords, str):
+    keywords = [k.strip() for k in keywords.split(",") if k.strip()]
+elif isinstance(keywords, list):
+    keywords = [str(k).strip() for k in keywords if str(k).strip()]
+else:
+    keywords = []
+```
+- ❌ **금지**: `re.split(r"[,\\s]+", ...)` — 공백까지 분리하면 "실내 관광지" → "실내", "관광지" (버그)
+- 타입 검사 없이 바로 `.split()` 또는 iteration하지 마라 — `str`/`list` 모두 받아야 한다
+
+### 2') MCP 통신 Persistence (subprocess 재사용)
+한 번의 스킬 실행 안에서 MCP 서버(`npx`)를 **여러 번 재시작하지 마라**. 지오코딩과 검색을 같은 subprocess에서 순차 수행하라.
+
+```python
+# ✅ 올바름 — subprocess 1회 열고 initialize 1회, 그 뒤 여러 tools/call 연속 호출
+proc = await asyncio.create_subprocess_exec(*cmd, stdin=..., stdout=..., env=env)
+try:
+    # initialize + notifications/initialized (한 번만)
+    ...
+    # tools/call #1: maps_geocode
+    ...
+    # tools/call #2, #3, ...: maps_search_places (같은 proc, id만 증가)
+    ...
+finally:
+    proc.terminate()
+
+# ❌ 금지 — 매 호출마다 subprocess를 새로 띄우는 방식
+for kw in keywords:
+    proc = await asyncio.create_subprocess_exec(...)   # ← 비효율, 초기화 비용 중복
+```
+
+### 3) Zero-Result Prevention + Smart Query (검색 결과 없음 방지·검색 전략)
+검색 쿼리가 너무 복잡하면 결과가 0건이 된다. **넓은 키워드 + 결과 필터링** 전략을 채택하라.
+
+```python
+# ❌ 금지 — 구체적 수식어로 좁혀서 검색
+query = "비 오는 날 가기 좋은 실내 핫플레이스"   # ← 결과 0건
+
+# ✅ 권장 — 넓은 기본 카테고리로 검색 후 types/description에서 실내 필터링
+INDOOR_TYPES = {{"museum", "art_gallery", "cafe", "shopping_mall", "library",
+                "aquarium", "movie_theater", "spa", "restaurant", "bakery"}}
+
+# ⚠️ CRITICAL — rating 필터링 규칙 (버그 방지)
+#   1) rating이 None/없음 = "평점 미집계"일 뿐 "평점 낮음"이 아니다 → 필터 탈락시키지 마라
+#   2) rating이 있는 장소만 min_rating으로 비교, 없으면 일단 통과시켜라
+#   3) min_rating 기본값은 0.0 (호출자가 명시하지 않으면 필터 off)
+#   4) user_ratings_total(리뷰 수)을 rating으로 폴백하지 마라 — 전혀 다른 값이다
+def passes_rating(place, min_r):
+    r = place.get("rating")
+    if r is None or r == 0:
+        return True   # 평점 미집계 → 필터 통과 (낙오 방지)
+    try: return float(r) >= float(min_r)
+    except: return True
+
+# ⚠️ CRITICAL — tried_keywords는 루프 안에서 반드시 append로 누적해야 한다.
+#             0건 시 진단 정보(Self-Logging)에 실제 사용 키워드가 기록되어야 한다.
+tried_keywords = []        # 실제 검색에 쓴 키워드 누적 리스트
+merged, seen = [], set()
+base_keywords = ["카페", "명소", "맛집"]   # categories 파라미터가 있으면 여기서 생성
+for kw in base_keywords:
+    tried_keywords.append(kw)              # ← 반드시 기록!
+    result = await call_mcp_in_same_proc(proc, "maps_search_places",
+                                         {{"query": kw, "location": coords}})
+    for place in extract_places(result):
+        pid = place.get("place_id")
+        if not pid or pid in seen:
+            continue
+        # 1차 필터: 실내 types OR name/addr에 '실내/indoor' (OR 사용 — AND는 너무 엄격)
+        types = set(place.get("types", []) or [])
+        desc = (place.get("name", "") + " " + (place.get("formatted_address") or "")).lower()
+        indoor_ok = bool(types & INDOOR_TYPES) or "indoor" in desc or "실내" in desc
+        rating_ok = passes_rating(place, min_rating)
+        if indoor_ok and rating_ok:
+            merged.append(place); seen.add(pid)
+
+# ⚠️ 단계적 완화 (Graceful Degradation) — 결과가 너무 적을 때 필터를 순차적으로 풀어라
+if len(merged) < 3:   # 3건 미만이면 rating 필터 해제 재시도
+    for place in all_candidates_seen:   # 1차에서 수집한 전체 후보
+        pid = place.get("place_id")
+        if pid in seen: continue
+        if indoor_ok_for(place):
+            merged.append(place); seen.add(pid)
+
+if len(merged) < 3:   # 여전히 부족하면 indoor 필터도 해제 (rating만 OR 무필터)
+    for place in all_candidates_seen:
+        pid = place.get("place_id")
+        if pid in seen: continue
+        merged.append(place); seen.add(pid)
+```
+- **키워드 리스트는 합치지 말고 개별 루프** — place_id로 중복 제거
+- **`tried_keywords.append(kw)`를 루프 안에서 반드시 호출** — 진단 정보에 기록되어야 한다
+- types/name 기반 **사후 필터링**으로 좁혀라 (쿼리에 "실내"를 붙이는 것보다 훨씬 안전)
+- `categories` 파라미터가 입력되면 `base_keywords = list(categories)`로 채워서 루프를 돌려라 (input을 무시하고 하드코딩 리스트만 쓰지 말 것)
+- **단계적 완화 필수**: 결과가 3건 미만이면 rating 필터 → indoor 필터 순서로 해제 후 재선별 (한 번 수집한 후보를 버리지 마라)
+
+### 4) No-Guessing Policy (추측 금지)
+MCP 도구의 inputSchema와 응답 구조를 **절대 추측하지 마라**.
+- 파라미터명/타입: 반드시 위 "사용 가능한 도구 목록"의 `inputSchema.properties`를 보고 작성하라
+- Google Maps 등 lat/lng 도구는 `location` 파라미터를 `{{"latitude": X, "longitude": Y}}` **객체**로 보내라 (문자열 금지)
+- 과거 경험·문서 예시를 그대로 쓰지 말고 **이번 호출에서 확인한 실제 스키마**만 사용하라
+
+### 5) Self-Validation + Self-Logging (자가 검증·자가 진단)
+생성한 스킬은 **첫 실행에서 실패하면 안 된다**. 코드 합성 시 다음을 반드시 시뮬레이션하라:
+- **샘플 입력 시나리오** (예: `location="애월"`, `location={{"latitude":33.41,"longitude":126.39}}`) 두 경우를 머릿속으로 돌려 **두 경로 모두 동작**하는지 확인하라
+- **응답 파싱 에러 시 재시도/폴백 경로**를 포함하라 (json.loads 실패 → JSON 블록 re.search 재시도 → 원본 text 유지)
+- 코드 작성 후 스스로 리뷰: "이 함수에 '애월' 문자열만 전달해도 / 좌표 dict만 전달해도 / keywords를 str로 전달해도 모두 동작하는가? 모두 YES면 통과."
+
+**Self-Logging (결과 0건 시 진단 정보 필수)**:
+검색 결과가 0건일 때 단순히 "결과 없음"만 반환하지 마라 — 사장님이 원인을 파악할 수 있도록 **실제 사용한 좌표와 키워드**를 함께 반환하라.
+
+⚠️ **CRITICAL — `tried_keywords`는 반드시 루프 안에서 `.append()`로 누적되어 있어야 한다.** 빈 리스트 `[]`를 반환하면 진단이 무용지물이다. 함수 끝에서 리스트를 반환하기 전에 `assert tried_keywords or not_searched_flag` 같은 체크를 머릿속으로 해보라.
+
+```python
+# 함수 시작 부분에서 초기화
+tried_keywords = []
+
+# 검색 루프 안에서 반드시 기록
+for kw in base_keywords:
+    tried_keywords.append(kw)      # ← 빠뜨리면 안 됨
+    ...
+
+# 0건 시 반환
+if not merged:
+    return {{
+        "결과없음": True,
+        "detail": f"'{{location}}' 인근 {{radius}}m 이내 검색 결과 0건",
+        "검색조건": {{
+            "좌표": {{"latitude": lat, "longitude": lng}},
+            "사용된_키워드": tried_keywords,   # ← 실제 채워진 리스트여야 함
+            "반경(m)": radius,
+            "필터": "indoor types + 한글 '실내' 키워드",
+        }},
+        "원인_추정": "키워드가 너무 구체적이거나 해당 좌표 주변에 해당 타입 장소가 없음"
+    }}
+```
 
 ## ⛔ 데이터 조작 절대 금지 (CRITICAL — 가장 중요한 규칙)
 생성하는 스킬 코드는 **절대로 가짜 데이터, placeholder, 예시 데이터를 반환하면 안 된다.**
@@ -1848,8 +2099,29 @@ class SkillFactory:
         from core.executor import _TOOL_REGISTRY
         email_keywords = {"email", "mail", "smtp", "이메일", "메일"}
         user_req_lower = user_request.lower()
-        if any(kw in user_req_lower for kw in email_keywords):
-            return await self._handle_email_skill(user_request)
+        email_hit = any(kw in user_req_lower for kw in email_keywords)
+        if email_hit:
+            # 부정/배제 맥락 감지: "이메일 전송은 별도", "이메일 말고", "메일 제외" 등
+            import re as _re_email
+            neg_patterns = [
+                r"(이메일|메일|email|mail)\s*[은는이가]?\s*(별도|제외|말고|아닌|빼고|아니|제외하고)",
+                r"(별도로|따로)\s*(처리|전송|보낼)",
+                r"이메일\s*전송은\s*(별도|따로|제외|하지)",
+                r"(하지\s*않|안\s*보내|안보내)",
+            ]
+            is_negated = any(_re_email.search(p, user_req_lower) for p in neg_patterns)
+            # 장소/가이드 의도 감지
+            place_intent_keywords = {"장소", "관광", "카페", "맛집", "핫플", "추천",
+                                     "가이드", "검색", "주변", "인근", "지도",
+                                     "places", "guide", "search", "restaurant"}
+            has_place_intent = any(kw in user_req_lower for kw in place_intent_keywords)
+            # 부정 맥락 또는 장소 의도가 강하면 이메일 분기 건너뛰기
+            if is_negated or has_place_intent:
+                await _log("system",
+                    "⚠️ [이메일 분기 건너뜀] 부정 문맥 또는 장소/가이드 의도 감지 — 정상 합성 경로로 진행",
+                    "[이메일 분기 스킵]")
+            else:
+                return await self._handle_email_skill(user_request)
 
         # ── Phase 0: Reusability Check (기존 스킬 재사용 판단) ──
         reuse_result = await self._check_reusability(user_request)
@@ -2306,26 +2578,42 @@ class SkillFactory:
 
         # 키워드 기반 빠른 매칭
         req_lower = user_request.lower()
-        # 요청에서 의미 있는 키워드 추출 (불용어 제거)
+
+        # 부정 컨텍스트 감지: "X 아닌", "X 말고", "X 제외", "X 없는" 패턴에서 X 추출 → 매칭 제외
+        import re as _re
+        _negation_pattern = _re.compile(
+            r'(\S+)\s*(?:이\s*)?(?:아닌|말고|제외|없는|빼고|아니라|아니고)'
+        )
+        negated_keywords = set()
+        for m in _negation_pattern.finditer(req_lower):
+            negated_keywords.update(m.group(1).split())
+
+        # 요청에서 의미 있는 키워드 추출 (불용어 + 부정 키워드 제거)
         stopwords = {
             "을", "를", "이", "가", "에", "의", "로", "와", "과", "하", "해", "줘", "좀",
             "알려", "보여", "찾아", "검색", "조회", "만들어", "기능", "스킬", "새",
             "the", "a", "an", "is", "to", "for", "and", "or", "in", "on", "me", "please",
         }
-        req_keywords = {w for w in req_lower.split() if len(w) > 1 and w not in stopwords}
+        req_keywords = {
+            w for w in req_lower.split()
+            if len(w) > 1 and w not in stopwords and w not in negated_keywords
+        }
 
         best_match = None
         best_score = 0
 
         for skill in all_skills:
-            skill_desc = (skill.get("description", "") + " " + skill.get("name", "")).lower()
-            matched = sum(1 for kw in req_keywords if kw in skill_desc)
+            # 단어 경계 기반 매칭 (substring 오탐 방지)
+            skill_words = set(
+                (skill.get("description", "") + " " + skill.get("name", "")).lower().split()
+            )
+            matched = sum(1 for kw in req_keywords if kw in skill_words)
             if req_keywords and matched > best_score:
                 best_score = matched
                 best_match = skill
 
-        # 키워드 50% 이상 매칭되면 재사용 판단
-        if best_match and req_keywords and (best_score / len(req_keywords)) >= 0.5:
+        # 키워드 70% 이상 매칭되면 재사용 판단 (50% → 70%로 상향)
+        if best_match and req_keywords and (best_score / len(req_keywords)) >= 0.7:
             skill_name = best_match["name"]
 
             # 스킬이 executor에 등록되어 있는지 확인, 없으면 활성화
