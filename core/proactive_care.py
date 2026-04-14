@@ -15,14 +15,13 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from openai import AsyncOpenAI
 from dotenv import load_dotenv
+from core.llm_client import get_llm_client, get_default_model
 
 load_dotenv()
 
@@ -31,8 +30,10 @@ logger = logging.getLogger("proactive_care")
 # ── 키워드 패턴 정의 ─────────────────────────────────────
 
 # 날씨/재해 키워드 → 카테고리 매핑
+# ⚠️ "rain"(일반 비)과 "heavy_rain"(폭우)는 반드시 구분할 것. 사장님 지시.
 _WEATHER_KEYWORDS: dict[str, list[str]] = {
-    "heavy_rain": ["폭우", "호우", "집중호우", "폭풍우", "대비", "침수", "장마"],
+    "rain": ["비", "소나기", "빗줄기", "우산"],
+    "heavy_rain": ["폭우", "호우", "집중호우", "폭풍우", "침수", "장마"],
     "snow": ["눈", "폭설", "대설", "적설", "빙판"],
     "wind": ["강풍", "태풍", "돌풍", "폭풍"],
     "heat": ["폭염", "무더위", "열사병", "고온"],
@@ -42,7 +43,8 @@ _WEATHER_KEYWORDS: dict[str, list[str]] = {
 
 # 긴급도 매핑
 _URGENCY_MAP: dict[str, str] = {
-    "heavy_rain": "high",
+    "rain": "medium",        # 일반 비 — 야외활동 불편 수준
+    "heavy_rain": "high",    # 폭우 — 침수·안전 위험
     "snow": "high",
     "wind": "critical",
     "heat": "medium",
@@ -148,14 +150,21 @@ def save_pending_auto_rule(
     approved_action: str,
     skill_name: str = "",
     condition_description: str = "",
+    skill_sequence: Optional[list] = None,
 ) -> None:
-    """자동화 규칙 등록 대기 — 사장님 승인 후 register_care_rule 호출."""
+    """자동화 규칙 등록 대기 — 사장님 승인 후 register_care_rule 호출.
+
+    skill_sequence: 최종적으로 성공한 스킬 호출 순서와 파라미터.
+                    [{"skill_name": "xxx", "args": {...}}, ...] 형태.
+                    지정되면 다음 트리거 시 이 시퀀스만 재실행된다(폴백 탐색 생략).
+    """
     global _pending_auto_rule
     _pending_auto_rule = {
         "trigger_category": trigger_category,
         "approved_action": approved_action,
         "skill_name": skill_name,
         "condition_description": condition_description,
+        "skill_sequence": skill_sequence or [],
     }
 
 
@@ -187,8 +196,8 @@ class ProactiveCareEngine:
     """선제적 케어 엔진: 키워드 감지 → 상황 분석 → 케어 제안 → 자동화 학습."""
 
     def __init__(self):
-        self._client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        self._model = os.getenv("OPENAI_MODEL", "gpt-4o")
+        self._client = get_llm_client()
+        self._model = get_default_model()
 
     # ── Stage 1: Simulated Sensing (키워드 감지) ─────────
 
@@ -244,13 +253,15 @@ class ProactiveCareEngine:
         # 시나리오별 필수 제안 규칙
         scenario_rules = ""
         if previous_weather == "sunny" and current_weather_condition in ("rain", "heavy_rain"):
-            scenario_rules = """
+            _weather_word = "폭우" if current_weather_condition == "heavy_rain" else "비"
+            scenario_rules = f"""
 
 ## 필수 제안 (반드시 포함할 것)
-맑은 날씨에서 비로 변경된 상황이므로, 다음 두 가지 액션을 proposals에 반드시 포함하세요:
+맑은 날씨에서 {_weather_word}(으)로 변경된 상황이므로, 다음 두 가지 액션을 proposals에 반드시 포함하세요:
 1. **실내 핫플레이스 가이드 제작 및 투숙객 전송** — 숙소 주변의 실내 관광지, 카페, 맛집 등을 정리한 가이드를 만들어 투숙객에게 이메일로 전송
 2. **주변 공방 할인권 탐색 및 투숙객 전송** — 숙소 인근의 도자기/캔들/가죽 등 체험 공방 할인 프로그램을 찾아 투숙객에게 안내
-추가로 상황에 적합한 제안을 1개 더 포함할 수 있습니다."""
+추가로 상황에 적합한 제안을 1개 더 포함할 수 있습니다.
+⚠️ 사용자에게 보내는 모든 텍스트에서 현재 날씨를 "{_weather_word}"로만 표현하세요. {'"비"라고 쓰지 마세요' if _weather_word == '폭우' else '"폭우"라는 단어는 절대 사용하지 마세요'}."""
 
         prompt = f"""당신은 숙소의 선제적 고객 케어 어시스턴트입니다. 날씨 변화를 감지하고,
 현재 숙박 중인 투숙객을 위한 선제적 케어 제안을 생성하세요.
@@ -266,7 +277,8 @@ class ProactiveCareEngine:
 {scenario_rules}
 
 ## 규칙
-1. risk_level: 날씨 심각도에 따라 결정 (태풍/폭설=critical, 폭우/강풍=high, 비/눈=medium, 흐림/맑음=low)
+1. risk_level: 날씨 심각도에 따라 결정 (태풍/폭설=critical, 폭우(heavy_rain)/강풍=high, 일반 비(rain)/눈=medium, 흐림/맑음=low)
+   ⚠️ **"rain"(일반 비)와 "heavy_rain"(폭우)는 반드시 구분**. 현재 날씨가 "rain"이면 "비"로만 표현하고 "폭우"라는 단어를 사용하지 마세요.
 2. proposals는 2~3개, 투숙객 경험 향상에 초점을 맞춘 구체적 액션
 3. 각 제안은 숙소 위치({location or '미정'}) 주변 맥락을 반영
 4. 기존 도구(send_telegram_message, 이메일 등)로 처리 가능한 것은 requires_skill: false
@@ -385,10 +397,15 @@ class ProactiveCareEngine:
         approved_action: str,
         skill_name: Optional[str] = None,
         skill_args_template: Optional[dict] = None,
+        skill_sequence: Optional[list] = None,
     ) -> dict:
         """
         승인된 케어 패턴을 Active Rule로 등록.
         동일 트리거가 다시 감지되면 자동 실행된다.
+
+        skill_sequence: 최종 성공한 스킬 호출 순서(list[{skill_name, args}]).
+                        지정되면 다음 트리거 시 MCP/API/웹검색 폴백 탐색 없이
+                        이 시퀀스만 재실행된다.
         """
         rules = _load_rules()
 
@@ -397,6 +414,9 @@ class ProactiveCareEngine:
             if r["trigger_category"] == trigger_category and r["action"] == approved_action:
                 r["approval_count"] = r.get("approval_count", 1) + 1
                 r["last_approved"] = datetime.now().isoformat()
+                # skill_sequence가 새로 들어오면 갱신(최신 성공 경로로 업데이트)
+                if skill_sequence:
+                    r["skill_sequence"] = skill_sequence
                 _save_rules(rules)
                 return {"status": "updated", "rule": r}
 
@@ -406,6 +426,7 @@ class ProactiveCareEngine:
             "action": approved_action,
             "skill_name": skill_name,
             "skill_args_template": skill_args_template,
+            "skill_sequence": skill_sequence or [],
             "approval_count": 1,
             "auto_execute": True,  # 사장님이 명시적으로 승인했으므로 즉시 자동 실행 활성화
             "created_at": datetime.now().isoformat(),
@@ -472,10 +493,11 @@ class ProactiveCareEngine:
         키워드 감지를 건너뛰고 바로 상황 분석 → 케어 제안 생성.
         """
         # condition → category 매핑
+        # "rain"(일반 비)과 "heavy_rain"(폭우)는 별개 카테고리. 혼용 금지.
         _CONDITION_TO_CATEGORY = {
             "sunny": "general",
             "cloudy": "general",
-            "rain": "heavy_rain",
+            "rain": "rain",
             "heavy_rain": "heavy_rain",
             "snow": "snow",
             "heavy_snow": "snow",

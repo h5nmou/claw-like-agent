@@ -12,7 +12,7 @@ import os
 from datetime import datetime
 
 import httpx
-from openai import AsyncOpenAI
+from core.llm_client import get_llm_client, get_default_model
 
 from core.executor import tool
 from core.proactive_care import get_care_engine, save_pending_auto_rule
@@ -184,9 +184,9 @@ async def create_local_guide(
 이메일 본문에 바로 사용할 수 있는 텍스트로 작성하세요."""
 
     try:
-        client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        client = get_llm_client()
         resp = await client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+            model=get_default_model(),
             messages=[{"role": "user", "content": prompt}],
             temperature=0.4,
         )
@@ -217,19 +217,29 @@ async def propose_care_automation(
     approved_action: str,
     skill_name: str = "",
     condition_description: str = "",
+    skill_sequence: list = None,
 ) -> dict:
     """케어 액션 완료 후, 사장님에게 자동화 규칙 등록 여부를 텔레그램으로 질문한다. register_care_rule 대신 이 도구를 사용하라.
 
     Args:
-        trigger_category (str): 트리거 카테고리 (heavy_rain, snow, wind, heat, cold, general)
+        trigger_category (str): 트리거 카테고리. 반드시 구분: rain(일반 비) / heavy_rain(폭우) / snow / wind / heat / cold / general
         approved_action (str): 승인된 액션 설명 (예: "폭우 시 실내 관광지 가이드 제작 및 이메일 발송")
-        skill_name (str): 실행에 사용된 스킬명 (선택)
+        skill_name (str): 실행에 사용된 대표 스킬명 (선택, 하위호환용)
         condition_description (str): 자동화 조건 설명 (예: "날씨가 맑음→비로 변경되고 해당 날짜 투숙객이 있는 경우")
+        skill_sequence (list): ⭐ **최종적으로 성공한 스킬 호출 순서와 파라미터**.
+            [{"skill_name": "generate_indoor_places_guide", "args": {"location": {...}, ...}},
+             {"skill_name": "send_email_via_smtp", "args": {"to_email": "...", ...}}] 형태.
+            이 목록은 다음 트리거 발생 시 **MCP/웹검색 폴백 없이 그대로 재실행**된다.
+            중간에 실패한 스킬(예: 결과 0건으로 폐기된 호출)은 포함시키지 마라.
+            사용자 요청을 완료시킨 마지막 성공 호출들만 순서대로 포함하라.
 
     Returns:
         질문 전송 결과
     """
     from core.telegram_client import telegram_client
+
+    if skill_sequence is None:
+        skill_sequence = []
 
     # 대기 중인 규칙 정보 저장
     save_pending_auto_rule(
@@ -237,15 +247,23 @@ async def propose_care_automation(
         approved_action=approved_action,
         skill_name=skill_name,
         condition_description=condition_description,
+        skill_sequence=skill_sequence,
     )
 
     # 사장님에게 텔레그램으로 자동화 등록 여부 질문
     condition_text = condition_description or f"{trigger_category} 감지 + 투숙객 존재"
+    sequence_text = ""
+    if skill_sequence:
+        sequence_text = "\n  • 재실행 시퀀스:\n" + "\n".join(
+            f"      {i+1}. {s.get('skill_name', '?')}"
+            for i, s in enumerate(skill_sequence)
+        )
     message = (
         f"📋 자동화 규칙 등록 요청\n\n"
         f"방금 수행한 작업:\n"
         f"  • {approved_action}\n"
-        f"  • 사용 스킬: {skill_name or '없음'}\n\n"
+        f"  • 사용 스킬: {skill_name or '없음'}"
+        f"{sequence_text}\n\n"
         f"다음에 동일한 조건이 발생하면 자동으로 이 작업을 수행할까요?\n"
         f"  조건: {condition_text}"
     )
@@ -283,7 +301,7 @@ async def register_care_rule(
     """[내부용 — 직접 호출 금지] 자동화 규칙을 등록한다. propose_care_automation을 대신 사용하라.
 
     Args:
-        trigger_category (str): 트리거 카테고리 (heavy_rain, snow, wind, heat, cold, general)
+        trigger_category (str): 트리거 카테고리. 반드시 구분: rain(일반 비) / heavy_rain(폭우) / snow / wind / heat / cold / general
         approved_action (str): 승인된 액션 설명 (예: "기상예보 상세 조회")
         skill_name (str): 실행에 사용된 스킬명 (선택)
 

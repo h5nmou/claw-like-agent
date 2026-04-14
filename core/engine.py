@@ -307,7 +307,12 @@ async def handle_telegram_message(text: str, chat_id: str):
                 f"✅ 사장님이 케어 제안을 승인: {text}",
                 "[선제적 케어]")
         else:
-            event["message"] = f"사장님이 '{text}'를 선택했지만, 대기 중인 케어 제안이 없습니다."
+            # 중복 버튼 클릭 — 첫 클릭에서 이미 proposal이 소비됨.
+            # LLM을 호출하지 않고 조용히 종료(불필요한 "대기 중인 케어 제안이 없습니다" 응답 방지).
+            await broadcaster.emit("system",
+                f"ℹ️ 중복 케어 버튼 클릭 무시: {text} (이미 처리된 제안)",
+                "[선제적 케어]")
+            return
 
     # ── 자동화 규칙 등록 승인/거부 콜백 ──
     elif text == "auto_rule_yes":
@@ -315,22 +320,31 @@ async def handle_telegram_message(text: str, chat_id: str):
         if pending_rule:
             clear_pending_auto_rule()
             care_engine = get_care_engine()
+            _seq = pending_rule.get("skill_sequence") or []
             result = care_engine.register_rule(
                 trigger_category=pending_rule["trigger_category"],
                 approved_action=pending_rule["approved_action"],
                 skill_name=pending_rule.get("skill_name"),
+                skill_sequence=_seq,
             )
             await broadcaster.emit(
                 "system",
-                f"✅ 자동화 규칙 등록 완료: {pending_rule['approved_action']}",
+                f"✅ 자동화 규칙 등록 완료: {pending_rule['approved_action']}"
+                + (f" (재실행 스킬 {len(_seq)}개)" if _seq else ""),
                 "[선제적 케어]",
             )
+            _seq_text = ""
+            if _seq:
+                _seq_text = "\n- 재실행 시퀀스:\n" + "\n".join(
+                    f"    {i+1}. {s.get('skill_name', '?')}" for i, s in enumerate(_seq)
+                )
             await telegram_client.send_message(
                 f"✅ 자동화 규칙이 등록되었습니다.\n"
                 f"- 트리거: {pending_rule['trigger_category']}\n"
                 f"- 액션: {pending_rule['approved_action']}\n"
-                f"- 스킬: {pending_rule.get('skill_name', '없음')}\n\n"
-                f"다음에 동일 조건 발생 시 자동으로 제안됩니다.",
+                f"- 스킬: {pending_rule.get('skill_name', '없음')}"
+                f"{_seq_text}\n\n"
+                f"다음에 동일 조건 발생 시 위 시퀀스를 그대로 재실행합니다.",
                 user_id=chat_id,
             )
         else:
@@ -362,6 +376,7 @@ async def handle_telegram_message(text: str, chat_id: str):
                 trigger_category=pending_rule["trigger_category"],
                 approved_action=pending_rule["approved_action"],
                 skill_name=pending_rule.get("skill_name"),
+                skill_sequence=pending_rule.get("skill_sequence") or [],
             )
             await broadcaster.emit(
                 "system",
@@ -567,7 +582,7 @@ async def run_agent_loop(trigger_event: dict) -> dict:
     await broadcaster.emit("divider", "PHASE 3 — Brain(LLM) 초기화", "")
     await broadcaster.emit(
         "system",
-        f"Brain 초기화 완료\n• System Prompt: Scene 규칙 ({len(system_prompt)}자)\n• Tools: {tool_names} ({len(tool_schemas)}개)\n• Model: {os.getenv('OPENAI_MODEL', 'gpt-4o')}",
+        f"Brain 초기화 완료\n• System Prompt: Scene 규칙 ({len(system_prompt)}자)\n• Tools: {tool_names} ({len(tool_schemas)}개)\n• Model: {os.getenv('OPENAI_MODEL', 'gemini-2.5-flash')}",
         "🧠 Brain 초기화"
     )
     brain = Brain(system_prompt=system_prompt, tools_schema=tool_schemas)
@@ -733,6 +748,36 @@ async def run_agent_loop(trigger_event: dict) -> dict:
         )
         _auto = trigger_event.get("proactive_care", {}).get("auto_actions", [])
         if _auto:
+            _registered_skills = [a.get("skill_name") for a in _auto if a.get("skill_name")]
+            _skill_list_txt = ", ".join(f"`{s}`" for s in _registered_skills) if _registered_skills else "(스킬 지정 없음)"
+
+            # ⭐ skill_sequence가 기록된 규칙이 있으면 정확한 재실행 지시를 생성
+            _sequence_blocks = []
+            for a in _auto:
+                seq = a.get("skill_sequence") or []
+                if seq:
+                    lines = []
+                    for i, s in enumerate(seq, 1):
+                        sname = s.get("skill_name", "?")
+                        args = s.get("args") or {}
+                        try:
+                            args_json = json.dumps(args, ensure_ascii=False)
+                        except Exception:
+                            args_json = str(args)
+                        lines.append(f"    {i}. `{sname}` — 기본 파라미터: {args_json}")
+                    _sequence_blocks.append(
+                        f"  • [{a.get('action', '액션')}] 정확한 재실행 시퀀스:\n"
+                        + "\n".join(lines)
+                    )
+            _sequence_text = ""
+            if _sequence_blocks:
+                _sequence_text = (
+                    "\n\n🎯 **저장된 정확한 재실행 시퀀스 (이 순서·파라미터로만 호출)**:\n"
+                    + "\n".join(_sequence_blocks)
+                    + "\n\n※ 위 args의 동적 값(예: 투숙객 이메일, 좌표)은 현재 이벤트에 포함된 실제 값으로 치환하세요. "
+                      "나머지(반경, 카테고리 등)는 그대로 사용하세요."
+                )
+
             care_context += (
                 f"\n⚡ **자동 실행 규칙 {len(_auto)}개 감지** — 즉시 실행하세요:\n"
                 + "\n".join(
@@ -740,11 +785,21 @@ async def run_agent_loop(trigger_event: dict) -> dict:
                     + (f" (스킬: {a['skill_name']})" if a.get("skill_name") else "")
                     for a in _auto
                 )
+                + _sequence_text
                 + "\n"
                 "\n**[자동 실행 모드]** 사장님 승인 없이 즉시 위 규칙들을 실행하세요."
                 "\n승인 절차가 이미 자동화되어 있습니다 (3회 이상 승인 이력)."
                 "\n실행 완료 후 send_telegram_message로 사장님에게 **결과만 보고**하세요."
                 "\npropose_care_automation 호출은 불필요합니다 (이미 등록된 규칙).\n"
+                f"\n⛔ **CRITICAL — 스킬 재생성·탐색 절대 금지**:\n"
+                f"  - 이 Active Rule은 이미 검증된 스킬 [{_skill_list_txt}]을(를) 사용합니다.\n"
+                f"  - **`create_new_skill` 호출 금지.** MCP 재탐색·웹 검색 폴백도 금지.\n"
+                f"  - 저장된 재실행 시퀀스가 있으면 **그 순서·파라미터 그대로 순차 호출**하세요.\n"
+                f"  - 스킬이 `결과없음`을 반환해도 **새 스킬을 만들지 말고**, "
+                f"그 사실을 그대로 사장님에게 텔레그램으로 보고하세요 "
+                f"(예: '비 오는 날 실내 가이드 — 결과 0건: 좌표 X, 키워드 Y, 반경 Z').\n"
+                f"  - 필요시 **같은 스킬을 다른 파라미터**(더 넓은 반경 등)로 한 번만 재시도하세요. "
+                f"그래도 0건이면 사장님께 상황만 보고하고 종료하세요.\n"
             )
         else:
             care_context += (

@@ -27,7 +27,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 import httpx
-from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
 from core.smithery_client import get_smithery_client
@@ -60,14 +59,7 @@ async def _log(level: str, msg: str, meta: str = "") -> None:
 
 # ── LATM 모델 설정 ──────────────────────────────────────────
 
-def _get_maker_model() -> str:
-    """Maker (고성능 모델) — 코드 생성 + 피어 리뷰."""
-    return os.getenv("SKILL_MAKER_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o"))
-
-
-def _get_user_model() -> str:
-    """User (경량 모델) — 실제 실행 시 사용."""
-    return os.getenv("SKILL_USER_MODEL", "gpt-4o-mini")
+from core.llm_client import get_llm_client, get_maker_model as _get_maker_model, get_user_model as _get_user_model  # noqa: E402
 
 
 # ── API 탐색 ─────────────────────────────────────────────
@@ -80,7 +72,7 @@ class APIDiscovery:
 
     def __init__(self) -> None:
         self.serper_key = os.getenv("SERPER_API_KEY")
-        self._client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        self._client = get_llm_client()
         self.smithery = get_smithery_client()
 
     async def search(self, query: str) -> list[dict]:
@@ -232,31 +224,8 @@ class APIDiscovery:
         if official_mcp:
             return official_mcp
 
-        # ── Tier 2: 레지스트리 심층 탐색 (Smithery / Awesome-MCP) ──
-        # Smithery는 웹 검색보다 MCP 서버를 통한 실시간 데이터 접근에 훨씬 유리하다.
-        registry_result = await self._search_mcp_registries(user_request)
-        if registry_result:
-            return registry_result
-
-        # ── Tier 2 실패 + SMITHERY_API_KEY 미설정 → 사용자에게 설정 안내 ──
-        # 웹 검색(Tier 3)으로 가기 전에 Smithery 사용을 권장
-        if not self.smithery.is_available:
-            await _log("system",
-                "🔑 [Smithery API 키 필요] MCP 서버 탐색을 위해 SMITHERY_API_KEY가 필요합니다.\n"
-                "   Smithery는 실시간 데이터(맛집, 날씨, 지도 등)에 특화된 MCP 서버를 제공합니다.\n"
-                "   → https://smithery.ai/account/api-keys 에서 API 키를 발급받으세요.",
-                "[Smithery 설정 필요]")
-            return {
-                "strategy": "unknown",
-                "service_name": "Smithery MCP Registry",
-                "description": (
-                    "실시간 데이터를 위한 MCP 서버를 탐색하려면 SMITHERY_API_KEY가 필요합니다.\n"
-                    "https://smithery.ai/account/api-keys 에서 API 키를 발급받아 .env 파일에 추가해 주세요.\n"
-                    "설정 후 '설정 완료'라고 알려주시면 이어서 작업하겠습니다."
-                ),
-                "env_key_name": "SMITHERY_API_KEY",
-                "auth_required": True,
-            }
+        # ── Tier 2: 레지스트리 심층 탐색 — 정책상 비활성화됨 ──
+        # (사장님 지시: Smithery 시도하지 않음. 공식 MCP → npx 자동 실행 → 웹 검색 폴백으로 직행)
 
         # ── Tier 3: REST API / pip / 공공데이터포털 폴백 ──
         all_results = []
@@ -329,48 +298,8 @@ class APIDiscovery:
             f"   인증: {'필요 (' + env_key + ')' if auth_needed else '불필요'}",
             "[공식 MCP 발견]")
 
-        # ── Step A: Smithery 프록시로 연결 시도 (로컬 설치 불필요) ──
-        if self.smithery.is_available:
-            await _log("system",
-                f"🔌 [Tier 1 → Smithery 프록시] {info['server']}를 Smithery 프록시로 연결 시도...",
-                "[Smithery 프록시 시도]")
-            try:
-                servers = await self.smithery.search_servers(info["server"])
-                if servers:
-                    best = servers[0]
-                    details = await self.smithery.get_server_details(best["qualifiedName"])
-                    if details:
-                        mcp_url = details.get("deploymentUrl") or details.get("mcpUrl") or details.get("url", "")
-                        conn_id = await self.smithery.get_or_create_connection(
-                            best["qualifiedName"],
-                            server_url=mcp_url
-                        )
-                        if conn_id:
-                            tools = await self.smithery.list_tools(conn_id)
-                            await _log("system",
-                                f"✅ [Smithery 프록시 연결 성공] {info['server']} → 프록시 ID: {conn_id[:16]}...\n"
-                                f"   사용 가능 도구: {len(tools or [])}개",
-                                "[Smithery 프록시 성공]")
-                            return {
-                                "strategy": "mcp",
-                                "service_name": info["server"],
-                                "api_endpoint": f"https://api.smithery.ai/connections/{conn_id}/call",
-                                "pip_packages": [],
-                                "auth_required": True,
-                                "env_key_name": "SMITHERY_API_KEY",
-                                "description": info["description"],
-                                "implementation_hint": f"Smithery 프록시를 통해 {info['server']} MCP 서버 호출.",
-                                "smithery_connection_id": conn_id,
-                                "smithery_qualified_name": best["qualifiedName"],
-                                "mcp_tools": tools or details.get("tools", []),
-                                "mcp_registry_source": f"smithery.ai/server/{best['qualifiedName']}",
-                                "mcp_reliability": "high",
-                                "mcp_tier": "official_via_smithery",
-                            }
-            except Exception as e:
-                await _log("system",
-                    f"⚠️ [Smithery 프록시 실패] {e}",
-                    "[Smithery 프록시 실패]")
+        # ── Step A: Smithery 프록시 — 정책상 비활성화됨 ──
+        # (사장님 지시: Smithery 시도하지 않음. 바로 로컬 MCP 또는 npx 자동 실행으로 진행)
 
         # ── Step B: 로컬 MCP 서버 확인 ──
         local_mcp_url = os.getenv("MCP_SERVER_URL", "http://localhost:8080")
@@ -978,7 +907,7 @@ class CodeSynthesizer:
     """LATM Maker — 고성능 모델 기반 코드 생성기."""
 
     def __init__(self) -> None:
-        self._client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        self._client = get_llm_client()
 
     @staticmethod
     def _format_mcp_tools_context(strategy: dict) -> str:
@@ -1012,6 +941,9 @@ from core.executor import tool
 @tool
 async def YOUR_FUNCTION_NAME(param1: str, param2: str = "") -> dict:
     \"\"\"Docstring here.\"\"\"
+    import logging
+    logger = logging.getLogger(__name__)
+
     api_key = os.getenv("{env_key or 'YOUR_ENV_KEY'}", "")
     cmd = {cmd!r}
     env = {{**os.environ{f', "{env_key}": api_key' if env_key else ''}}}
@@ -1020,25 +952,36 @@ async def YOUR_FUNCTION_NAME(param1: str, param2: str = "") -> dict:
         stdin=asp.PIPE, stdout=asp.PIPE, stderr=asp.PIPE,
         env=env,
     )
+
+    async def _mcp_call(method: str, params: dict, call_id: int, timeout: int = 15):
+        \"\"\"MCP에 JSON-RPC 요청을 보내고 응답을 파싱. 요청/응답 원문을 로그로 기록.\"\"\"
+        req = {{"jsonrpc":"2.0","id":call_id,"method":method,"params":params}}
+        req_line = json.dumps(req, ensure_ascii=False) + "\\n"
+        logger.info(f"[MCP REQUEST] {{req_line.strip()}}")
+        proc.stdin.write(req_line.encode()); await proc.stdin.drain()
+        raw = await asyncio.wait_for(proc.stdout.readline(), timeout=timeout)
+        raw_text = raw.decode(errors="replace").strip()
+        logger.info(f"[MCP RESPONSE] {{raw_text}}")
+        return json.loads(raw_text) if raw_text else {{}}
+
     try:
         # 1) initialize
-        init = json.dumps({{"jsonrpc":"2.0","id":1,"method":"initialize",
-            "params":{{"protocolVersion":"2024-11-05","capabilities":{{}},
-                       "clientInfo":{{"name":"agent","version":"1.0"}}}}}}) + "\\n"
-        proc.stdin.write(init.encode()); await proc.stdin.drain()
-        await asyncio.wait_for(proc.stdout.readline(), timeout=20)
+        await _mcp_call("initialize",
+            {{"protocolVersion":"2024-11-05","capabilities":{{}},
+              "clientInfo":{{"name":"agent","version":"1.0"}}}},
+            call_id=1, timeout=20)
 
-        # 2) notifications/initialized
+        # 2) notifications/initialized (no response expected)
         notif = json.dumps({{"jsonrpc":"2.0","method":"notifications/initialized","params":{{}}}}) + "\\n"
+        logger.info(f"[MCP NOTIFY] {{notif.strip()}}")
         proc.stdin.write(notif.encode()); await proc.stdin.drain()
 
-        # 3) tools/call
-        call = json.dumps({{"jsonrpc":"2.0","id":2,"method":"tools/call",
-            "params":{{"name":"maps_search_places",  # 도구 목록에서 선택
-                       "arguments":{{"query": param1}}}}}}) + "\\n"
-        proc.stdin.write(call.encode()); await proc.stdin.drain()
-        raw = await asyncio.wait_for(proc.stdout.readline(), timeout=15)
-        data = json.loads(raw)
+        # 3) tools/call — 요청/응답 모두 자동 로깅됨
+        data = await _mcp_call("tools/call",
+            {{"name":"maps_search_places",  # 도구 목록에서 선택
+              "arguments":{{"query": param1}}}},
+            call_id=2, timeout=15)
+
         content = data.get("result", {{}}).get("content", [])
         # ⚠️ content[].text는 JSON 문자열인 경우가 많음 — 반드시 json.loads()로 파싱
         parsed = None
@@ -1051,6 +994,7 @@ async def YOUR_FUNCTION_NAME(param1: str, param2: str = "") -> dict:
                     parsed = c["text"]  # 일반 텍스트면 원본 유지
         return {{"결과": parsed}} if parsed is not None else {{"결과없음": True, "detail": str(data)}}
     except Exception as e:
+        logger.exception(f"[MCP ERROR] {{e}}")
         return {{"error": str(e), "detail": "stdio MCP 통신 실패"}}
     finally:
         if proc.returncode is None:
@@ -1065,6 +1009,7 @@ async def YOUR_FUNCTION_NAME(param1: str, param2: str = "") -> dict:
 3. initialize → notifications/initialized → tools/call 순서 필수
 4. proc.terminate() 반드시 finally 블록에서 호출
 5. 반환값은 dict — subprocess 객체나 coroutine 절대 반환 금지
+6. **⚠️ MCP 요청/응답 원문 로깅 필수** — 위 `_mcp_call` 헬퍼처럼 모든 tools/call 직전에 `logger.info(f"[MCP REQUEST] {{req}}")`, 직후에 `logger.info(f"[MCP RESPONSE] {{raw}}")`를 찍어라. 디버깅 가능한 스킬만 유지된다.
 
 ### ⚠️ MCP 응답 파싱 규칙 (CRITICAL — 이 부분을 틀리면 스킬이 무조건 실패)
 MCP 서버의 `tools/call` 응답은 **항상** 다음 구조다:
@@ -1408,35 +1353,69 @@ if content and isinstance(content, list):
         try:
             parsed = json.loads(text)
         except (json.JSONDecodeError, ValueError):
-            # 2차 시도: JSON 덩어리만 추출 (설명 문구가 섞여있을 때)
-            m = re.search(r"(\\[.*\\]|\\{{.*\\}})", text, re.DOTALL)  # [ ] 또는 {{ }} 블록
-            if m:
+            # 2차 시도: 순수 JSON 블록만 잘라내기 — find('{')와 rfind('}') 또는 [] 사용
+            #          (응답 앞뒤에 "Server running...", 로그 노이즈 등이 섞일 수 있음)
+            obj_start, obj_end = text.find("{{"), text.rfind("}}")
+            arr_start, arr_end = text.find("["), text.rfind("]")
+            json_block = None
+            # 둘 다 발견되면 더 바깥쪽(앞쪽이 빠른 쪽)을 선택
+            candidates = []
+            if obj_start != -1 and obj_end != -1 and obj_end > obj_start:
+                candidates.append((obj_start, text[obj_start:obj_end+1]))
+            if arr_start != -1 and arr_end != -1 and arr_end > arr_start:
+                candidates.append((arr_start, text[arr_start:arr_end+1]))
+            if candidates:
+                candidates.sort(key=lambda x: x[0])
+                json_block = candidates[0][1]
+            if json_block:
                 try:
-                    parsed = json.loads(m.group(1))
+                    parsed = json.loads(json_block)
                 except (json.JSONDecodeError, ValueError):
                     parsed = text
             else:
                 parsed = text
 ```
 - `content[0]["text"]`는 대부분 **JSON 문자열** → `json.loads()` 필수
-- JSON 앞뒤에 자연어가 붙어있을 수 있음 → `re.search(r"(\\[...\\]|\\{{...\\}})", ..., re.DOTALL)`로 JSON 블록만 추출 후 재파싱
+- JSON 앞뒤에 자연어/로그 노이즈가 붙어있을 수 있음 → **`text.find('{{')`와 `text.rfind('}}')` (또는 `[ ]`)로 순수 JSON 블록만 잘라낸 뒤 재파싱**. 정규표현식보다 빠르고 안정적
 - 존재하지 않는 타입(`"geo"`, `"places"` 등)을 가정하지 마라 — content 타입은 대부분 `"text"` 하나다
+
+**⚠️ 파싱된 객체의 형태 — list / dict 둘 다 처리 필수 (CRITICAL)**
+파싱된 JSON은 세 가지 형태 중 하나로 온다. 하나만 가정하면 빈 결과로 조기 종료된다.
+```python
+# maps_search_places 실제 응답: {{"places": [...]}} 또는 {{"results": [...]}} 또는 그냥 [...]
+if isinstance(parsed, list):
+    places = parsed                                      # 형태 A
+elif isinstance(parsed, dict):
+    places = parsed.get("places") or parsed.get("results") or []   # 형태 B/C
+else:
+    places = []
+```
+- ❌ **금지**: `if isinstance(parsed, list):` 만 체크 → dict 응답을 통째로 버려서 "결과없음" 버그
+- ✅ **필수**: list 분기 + dict 분기 두 갈래 모두 처리. dict면 `"places"` → `"results"` → `"items"` 순으로 키 탐색
 
 ### 2) Input Type Resilience + Flexible Types (다형 입력 방어)
 모든 파라미터는 `isinstance()`로 타입을 먼저 확인하라. 호출자마다 포맷이 다를 수 있다.
 
-**2-a) location 파라미터 (문자열 주소 vs 좌표 객체)**
+**2-a) location 파라미터 (문자열 주소 vs 좌표 객체) — 하이브리드 입력 파이프라인**
 ```python
-if isinstance(location, str):
-    # 주소 문자열 → maps_geocode 호출
-    ...
-elif isinstance(location, dict):
-    # 좌표 객체 → geocoding 건너뛰고 직접 사용
+# ✅ isinstance로 먼저 확인하여 파이프라인 분기
+if isinstance(location, dict):
+    # 좌표 객체 → geocoding 건너뛰고 즉시 maps_search_places로 진입
     lat = location.get("latitude") or location.get("lat")
     lng = location.get("longitude") or location.get("lng")
+    coords = {{"latitude": float(lat), "longitude": float(lng)}}
+elif isinstance(location, str):
+    # 주소 문자열 → maps_geocode 먼저 실행 → 좌표 추출 후 maps_search_places
+    geo = await call_mcp("maps_geocode", {{"address": location}})
+    coords = extract_coords(geo)
+else:
+    return {{"error": "location은 str 또는 dict 여야 합니다"}}
+# 이후 동일한 coords로 검색 진행
+places = await call_mcp("maps_search_places", {{"query": q, "location": coords}})
 ```
 - 별도 `latitude: float = None, longitude: float = None` 파라미터도 추가해 직접 좌표 경로 허용
 - **좌표가 이미 있으면 geocoding 호출 금지** (한국어 주소는 ZERO_RESULTS 위험)
+- **dict 분기를 먼저 체크** — 좌표가 우선이고, 주소는 fallback
 
 **2-b) 키워드/카테고리 파라미터 (문자열 자동 분리)**
 ```python
@@ -1479,10 +1458,24 @@ for kw in keywords:
 ```python
 # ❌ 금지 — 구체적 수식어로 좁혀서 검색
 query = "비 오는 날 가기 좋은 실내 핫플레이스"   # ← 결과 0건
+query = "indoor cafe recommended"               # ← 마찬가지 0건 (수식어 포함)
+query = "실내 카페"                              # ← 0건 (수식어 + 한국어)
 
-# ✅ 권장 — 넓은 기본 카테고리로 검색 후 types/description에서 실내 필터링
+# ❌ 절대 금지 — 검색 쿼리에 형용사·수식어 포함
+#   '실내', 'indoor', '비오는날', '추천', 'recommended', 'best', 'popular' 같은 단어를
+#   query에 넣으면 Google Maps API가 이를 **상호명의 일부**로 오해하여 0건을 반환한다.
+#   ➡️ 수식어는 사후 필터(types, name/desc 검사)로 처리하라.
+
+# ✅ 권장 — 표준 카테고리(영어)만 query로 던지고, '실내 여부'는 사후 필터로 판정
 INDOOR_TYPES = {{"museum", "art_gallery", "cafe", "shopping_mall", "library",
-                "aquarium", "movie_theater", "spa", "restaurant", "bakery"}}
+                "aquarium", "movie_theater", "spa", "restaurant", "bakery",
+                "book_store", "department_store"}}
+# ⚠️ '실내' 판정은 INDOOR_TYPES 포함 + OUTDOOR_TYPES 미포함 두 조건으로 판단
+OUTDOOR_TYPES = {{"park", "hiking_area", "campground", "natural_feature",
+                 "stadium", "amusement_park", "zoo", "tourist_attraction"}}  # tourist_attraction은 야외 비중↑
+# 사후 필터 예시:
+#   types_set = set(place.get("types") or [])
+#   is_indoor = (types_set & INDOOR_TYPES) and not (types_set & OUTDOOR_TYPES)
 
 # ⚠️ CRITICAL — rating 필터링 규칙 (버그 방지)
 #   1) rating이 None/없음 = "평점 미집계"일 뿐 "평점 낮음"이 아니다 → 필터 탈락시키지 마라
@@ -1498,21 +1491,47 @@ def passes_rating(place, min_r):
 
 # ⚠️ CRITICAL — tried_keywords는 루프 안에서 반드시 append로 누적해야 한다.
 #             0건 시 진단 정보(Self-Logging)에 실제 사용 키워드가 기록되어야 한다.
-tried_keywords = []        # 실제 검색에 쓴 키워드 누적 리스트
+# ⚠️ CRITICAL — MCP 검색 쿼리는 반드시 영어로 보내라 (한국어 → 영어 매핑 필수).
+#             Google Maps 등 글로벌 MCP는 영어 쿼리에서 결과 품질이 훨씬 높다.
+KO_TO_EN_QUERY = {{
+    "카페": "cafe", "맛집": "restaurant", "관광지": "tourist attraction",
+    "박물관": "museum", "미술관": "art gallery", "갤러리": "gallery",
+    "명소": "landmark", "쇼핑몰": "shopping mall", "베이커리": "bakery",
+    "스파": "spa", "아쿠아리움": "aquarium", "영화관": "movie theater",
+    "도서관": "library", "공방": "workshop studio", "전시관": "exhibition hall",
+    "서점": "book store",
+    # ⚠️ "실내 카페", "실내 관광지" 같은 수식어 결합 키는 의도적으로 제외.
+    #     수식어가 query에 들어가면 Google Maps가 상호명으로 오해하여 0건이 됨.
+    #     "실내" 의도는 OUTDOOR_TYPES 제외 사후 필터로 처리한다.
+}}
+# 입력에 "실내 카페" 같이 수식어 + 카테고리가 섞여 있으면 카테고리만 추출
+def _strip_modifiers(ko: str) -> str:
+    for mod in ("실내 ", "실외 ", "감성 ", "유명한 ", "인기 ", "추천 "):
+        if ko.startswith(mod):
+            return ko[len(mod):]
+    return ko
+tried_keywords = []        # 실제 검색에 쓴 키워드(영어) 누적
 merged, seen = [], set()
-base_keywords = ["카페", "명소", "맛집"]   # categories 파라미터가 있으면 여기서 생성
-for kw in base_keywords:
-    tried_keywords.append(kw)              # ← 반드시 기록!
+# 입력 categories가 한국어여도 반드시 영어 쿼리로 변환 후 검색
+base_keywords_ko = list(categories) if isinstance(categories, list) else ["카페", "맛집", "명소"]
+base_keywords_en = [
+    KO_TO_EN_QUERY.get(_strip_modifiers(k.strip()), _strip_modifiers(k.strip()))
+    for k in base_keywords_ko
+]
+for kw in base_keywords_en:
+    tried_keywords.append(kw)              # ← 반드시 기록 (영어 쿼리 그대로)
     result = await call_mcp_in_same_proc(proc, "maps_search_places",
                                          {{"query": kw, "location": coords}})
     for place in extract_places(result):
         pid = place.get("place_id")
         if not pid or pid in seen:
             continue
-        # 1차 필터: 실내 types OR name/addr에 '실내/indoor' (OR 사용 — AND는 너무 엄격)
+        # 1차 필터: 야외 types 제외 + (실내 types 포함 OR name에 실내/indoor)
         types = set(place.get("types", []) or [])
         desc = (place.get("name", "") + " " + (place.get("formatted_address") or "")).lower()
-        indoor_ok = bool(types & INDOOR_TYPES) or "indoor" in desc or "실내" in desc
+        is_outdoor = bool(types & OUTDOOR_TYPES)        # 명백한 야외는 즉시 탈락
+        is_indoor = bool(types & INDOOR_TYPES) or "indoor" in desc or "실내" in desc
+        indoor_ok = is_indoor and not is_outdoor
         rating_ok = passes_rating(place, min_rating)
         if indoor_ok and rating_ok:
             merged.append(place); seen.add(pid)
@@ -1542,6 +1561,53 @@ MCP 도구의 inputSchema와 응답 구조를 **절대 추측하지 마라**.
 - 파라미터명/타입: 반드시 위 "사용 가능한 도구 목록"의 `inputSchema.properties`를 보고 작성하라
 - Google Maps 등 lat/lng 도구는 `location` 파라미터를 `{{"latitude": X, "longitude": Y}}` **객체**로 보내라 (문자열 금지)
 - 과거 경험·문서 예시를 그대로 쓰지 말고 **이번 호출에서 확인한 실제 스키마**만 사용하라
+
+### 4-0) MCP 통신 원문 로깅 (CRITICAL — 디버깅 필수)
+**모든 MCP tools/call 전후로 요청·응답 원문을 반드시 `logger.info`로 기록하라.**
+로그가 없으면 "결과없음" 원인이 쿼리인지·필터인지·MCP 응답인지 판별 불가능.
+
+```python
+import logging
+logger = logging.getLogger(__name__)
+
+async def _mcp_call(proc, method, params, call_id=1, timeout=15):
+    req = {{"jsonrpc":"2.0","id":call_id,"method":method,"params":params}}
+    req_line = json.dumps(req, ensure_ascii=False) + "\\n"
+    logger.info(f"[MCP REQUEST] {{req_line.strip()}}")   # ← 요청 원문
+    proc.stdin.write(req_line.encode()); await proc.stdin.drain()
+    raw = await asyncio.wait_for(proc.stdout.readline(), timeout=timeout)
+    raw_text = raw.decode(errors="replace").strip()
+    logger.info(f"[MCP RESPONSE] {{raw_text}}")           # ← 응답 원문(파싱 전)
+    return json.loads(raw_text) if raw_text else {{}}
+```
+
+- `[MCP REQUEST]` / `[MCP RESPONSE]` 고정 태그로 로그에서 쉽게 grep 가능하게 하라
+- `raw_text`는 **파싱 전 원본**을 찍어라. json.loads() 실패 원인 추적에 필수
+- 에러 발생 시 `logger.exception(...)`으로 traceback도 기록
+- 응답이 너무 길 것 같아도 잘라내지 말고 원문 전체 기록 (디버깅 용도)
+
+### 4-1) MCP 인자 영어화 정책 (CRITICAL — 글로벌 MCP 호환성)
+**모든 MCP 도구의 검색 쿼리·카테고리·키워드 인자는 반드시 영어로 보내라.**
+한국어 쿼리는 글로벌 MCP 서버(Google Maps, Smithery 등록 서버 다수)에서 결과 품질이 현저히 떨어지거나 0건이 된다.
+
+**필수 패턴**: 한국어 입력 → 영어 매핑 dict로 변환 → MCP 호출
+```python
+# ✅ 올바름 — 한국어 카테고리를 영어로 매핑 후 호출
+KO_TO_EN = {{"카페":"cafe", "맛집":"restaurant", "관광지":"tourist attraction",
+            "박물관":"museum", "미술관":"art gallery", "베이커리":"bakery",
+            "쇼핑몰":"shopping mall", "스파":"spa", "도서관":"library",
+            "공방":"workshop studio"}}
+en_query = KO_TO_EN.get(ko_keyword.strip(), ko_keyword.strip())
+await call_mcp("maps_search_places", {{"query": en_query, "location": coords}})
+
+# ❌ 금지 — 한국어 그대로 MCP에 전달
+await call_mcp("maps_search_places", {{"query": "카페", "location": coords}})  # 결과 품질 ↓
+```
+
+**예외**: `address`(geocoding) 같은 위치 정보는 한국어를 보내도 됨 (지오코딩 서버는 다국어 주소 지원).
+하지만 **검색 쿼리·카테고리는 무조건 영어**.
+
+**진단 로그**: `tried_keywords`에는 **실제 보낸 영어 쿼리**를 기록하라 (사장님이 원인 추적할 수 있도록).
 
 ### 5) Self-Validation + Self-Logging (자가 검증·자가 진단)
 생성한 스킬은 **첫 실행에서 실패하면 안 된다**. 코드 합성 시 다음을 반드시 시뮬레이션하라:
@@ -1650,7 +1716,7 @@ class PeerReviewer:
     """
 
     def __init__(self) -> None:
-        self._client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        self._client = get_llm_client()
 
     async def review(self, code: str, skill_name: str, strategy: dict) -> dict:
         """
@@ -2534,7 +2600,7 @@ class SkillFactory:
 }}"""
 
         try:
-            client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            client = get_llm_client()
             response = await client.chat.completions.create(
                 model=_get_user_model(),  # 경량 모델로 충분
                 messages=[{"role": "user", "content": prompt}],

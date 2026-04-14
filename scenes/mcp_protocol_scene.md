@@ -92,6 +92,105 @@ longitude = event.get("lng") or event.get("property_lng")  # 126.393147
 
 ---
 
+## 3-1. MCP 응답 페이로드 형태 (list / dict 둘 다 처리 필수)
+
+`content[0]["text"]`를 `json.loads()`한 결과는 세 가지 형태 중 하나:
+
+| 형태 | 예시 |
+|---|---|
+| A. list (단일 배열) | `[{"name": ...}, ...]` |
+| B. dict with `places` | `{"places": [{...}, ...]}` |
+| C. dict with `results` | `{"results": [{...}, ...]}` |
+
+반드시 **두 갈래 모두 처리**하라. list만 가정하면 dict 응답을 통째로 버려서 "결과없음" 버그가 난다.
+
+```python
+if isinstance(parsed, list):
+    items = parsed
+elif isinstance(parsed, dict):
+    items = parsed.get("places") or parsed.get("results") or parsed.get("items") or []
+else:
+    items = []
+```
+
+실제 Google Maps `maps_search_places` 응답은 **형태 B** (`{"places": [...]}`)다. 이걸 놓치면 20개 결과가 와도 0건으로 처리된다.
+
+---
+
+## 4-0. MCP 통신 원문 로깅 (필수)
+
+모든 MCP tools/call 직전·직후로 **요청과 응답을 원문 그대로** `logger.info`로 찍어라.
+
+```python
+logger.info(f"[MCP REQUEST] {req_json}")     # 전송 직전
+# ... stdin.write + stdout.readline ...
+logger.info(f"[MCP RESPONSE] {raw_text}")    # 파싱 직전(raw 원문)
+```
+
+- 태그는 `[MCP REQUEST]` / `[MCP RESPONSE]`로 통일 → 서버 로그에서 grep 가능
+- `raw_text`는 `json.loads()` 전 원문 — 파싱 실패 원인 추적에 필수
+- 응답 길이 잘라내기 금지 — 전체를 기록
+- 에러 시 `logger.exception(...)`으로 traceback 포함
+
+---
+
+## 5-0. 지능형 쿼리 전략 (Zero-Result 방지)
+
+MCP 검색 도구(`maps_search_places` 등) 호출 시 **쿼리에 형용사·수식어를 절대 포함하지 마라**. Google Maps API는 수식어를 상호명의 일부로 오해하여 0건을 반환한다.
+
+❌ **금지 쿼리**: `"실내 카페"`, `"indoor cafe"`, `"비 오는 날 핫플"`, `"recommended restaurant"`, `"인기 맛집"`, `"best museum"`
+
+✅ **올바름**: `"cafe"`, `"restaurant"`, `"museum"`, `"art_gallery"`, `"bakery"` — 표준 카테고리만
+
+**'실내 여부'는 사후 필터로 판정** (쿼리 단계에서 처리하지 마라):
+```python
+INDOOR_TYPES  = {"museum", "art_gallery", "cafe", "shopping_mall",
+                 "library", "aquarium", "movie_theater", "spa",
+                 "restaurant", "bakery", "book_store", "department_store"}
+OUTDOOR_TYPES = {"park", "hiking_area", "campground", "natural_feature",
+                 "stadium", "amusement_park", "zoo"}
+
+types_set = set(place.get("types") or [])
+is_indoor = (types_set & INDOOR_TYPES) and not (types_set & OUTDOOR_TYPES)
+```
+
+수식어가 입력에 섞여 있으면 코드에서 제거 후 카테고리만 추출하라:
+- `"실내 카페"` → `"cafe"`
+- `"감성 카페"` → `"cafe"`
+- `"인기 맛집"` → `"restaurant"`
+
+---
+
+## 5-1. 인자 영어화 원칙 (MCP Argument Language Policy)
+
+MCP 도구를 호출할 때 **검색 쿼리·카테고리·키워드 인자는 반드시 영어로** 보내라. 한국어 인자는 글로벌 MCP 서버(Google Maps 등)에서 결과 품질이 떨어지거나 0건이 된다.
+
+| 입력(한국어) | MCP 전달(영어) |
+|---|---|
+| 카페 | cafe |
+| 맛집 | restaurant |
+| 관광지 | tourist attraction |
+| 박물관 | museum |
+| 미술관 | art gallery |
+| 베이커리 | bakery |
+| 쇼핑몰 | shopping mall |
+| 스파 | spa |
+| 도서관 | library |
+| 공방 | workshop studio |
+
+```python
+# ✅ 올바름
+"query": "cafe"
+# ❌ 금지
+"query": "카페"
+```
+
+**예외**: `address`(geocoding 입력) 같이 위치 정보는 한국어 허용 (다국어 지원). 그러나 **검색 쿼리·카테고리는 무조건 영어**.
+
+진단 로그(`tried_keywords` 등)에도 **실제 전송한 영어 값**을 기록하라.
+
+---
+
 ## 6. No-Guessing Policy (추측 금지 원칙)
 
 스킬 코드를 작성하기 전, **반드시 대상 MCP의 `tools/list`를 호출**하여 파라미터의 `type`과 `properties`를 완벽히 분석하라.

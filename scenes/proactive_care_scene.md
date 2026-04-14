@@ -21,11 +21,16 @@
 
 | 조건 | 라벨 | 긴급도 |
 |------|------|--------|
-| heavy_rain | ⛈️ 폭우 | HIGH |
+| rain | 🌧️ 비 (일반 비) | MEDIUM |
+| heavy_rain | ⛈️ 폭우 (호우·집중호우) | HIGH |
 | snow / heavy_snow | ❄️ 눈 / 🌨️ 폭설 | HIGH |
 | wind / typhoon | 🌬️ 강풍 / 🌀 태풍 | CRITICAL |
 | heat | 🔥 폭염 | MEDIUM |
 | cold | 🥶 한파 | MEDIUM |
+
+⚠️ **"rain"과 "heavy_rain"은 별개 카테고리**. 사용자에게 보내는 모든 텍스트에서 현재 조건을 정확히 구분하세요:
+- `rain` → "비"로만 표현, "폭우"라는 단어 **절대 사용 금지**
+- `heavy_rain` → "폭우"로 표현
 
 **Webhook 구조:**
 ```json
@@ -207,9 +212,47 @@ STEP 5: 자동화 등록 질문 (사장님 승인 필수)
 ```
 trigger_category: 감지된 트리거 카테고리 (예: "heavy_rain")
 approved_action: 승인된 액션 설명 (예: "폭우 시 실내 관광지 가이드 제작 및 이메일 발송")
-skill_name: 실행에 사용된 스킬명 (있는 경우)
+skill_name: 실행에 사용된 대표 스킬명 (하위호환용, 선택)
 condition_description: 자동화 조건 설명 (예: "날씨가 맑음→비로 변경되고 해당 날짜 투숙객이 있는 경우")
+skill_sequence: ⭐ [필수] 실제로 사용자 요청을 완료시킨 "최종 성공 스킬 호출 시퀀스"
 ```
+
+### ⭐ skill_sequence — 최종 성공한 동작만 저장하는 규칙 (CRITICAL)
+
+`propose_care_automation`의 `skill_sequence`는 **다음 트리거 시 그대로 재실행되는 고정 시퀀스**입니다. 저장 방식이 자동화 품질을 결정하므로 다음 규칙을 반드시 준수하세요.
+
+**포함해야 할 것 (✅)**
+- 사용자 요청을 **실제로 완료시킨 마지막 성공 스킬 호출**들 (순서대로)
+- 각 호출의 `args`: 실제로 넘긴 파라미터 그대로 (동적 값은 이후 치환되므로 원본 값 유지)
+
+**절대 포함하지 마라 (❌)**
+- **탐색/폴백 과정에서 실패한 스킬 호출** (예: "결과없음"을 반환한 스킬, 버전 0.1로 만들었다가 폐기한 스킬)
+- `create_new_skill` 호출 — 이건 메타 액션이지 실제 사용자 액션이 아님
+- `web_search`, `create_local_guide` 같은 폴백 도구가 **최종 결과를 만들지 않았다면** 제외
+
+**예시**
+
+사용자 요청 수행 로그(요약):
+1. `create_indoor_activity_guide(...)` → 결과 0건 (실패)
+2. `create_new_skill(...)` → `generate_indoor_places_guide` 생성
+3. `generate_indoor_places_guide(location, categories, ...)` → ✅ 성공 (가이드 텍스트 획득)
+4. `send_email_via_smtp(to_email, subject, body)` → ✅ 성공 (이메일 전송 완료)
+
+→ 이때 `skill_sequence`에는 **3번과 4번만** 포함:
+```json
+[
+  {"skill_name": "generate_indoor_places_guide",
+   "args": {"location": {"latitude": 33.410571, "longitude": 126.393147},
+            "categories": "카페,맛집,박물관,미술관", "radius": 8000}},
+  {"skill_name": "send_email_via_smtp",
+   "args": {"to_email": "h5nmou@gmail.com",
+            "subject": "[폭우] 실내 가이드",
+            "body": "<가이드 텍스트>"}}
+]
+```
+
+1번(실패)과 2번(메타 액션)은 **절대 포함하지 마라**. 자동화 실행 시 LLM이 다시 폴백 루프에 빠진다.
+
 ⛔ `register_care_rule`은 시스템이 내부적으로 호출합니다. LLM이 직접 호출하지 마세요.
 
 ---

@@ -16,7 +16,6 @@ import asyncio
 import importlib.util
 import json
 import logging
-import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -24,7 +23,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from openai import AsyncOpenAI
+from core.llm_client import get_llm_client, get_default_model
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -97,7 +96,7 @@ class SkillHealer:
     MAX_RESTART_ATTEMPTS = 2
 
     def __init__(self) -> None:
-        self._client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        self._client = get_llm_client()
 
     async def heal(
         self,
@@ -339,7 +338,7 @@ class SkillHealer:
 
         try:
             response = await self._client.chat.completions.create(
-                model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+                model=get_default_model(),
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
             )

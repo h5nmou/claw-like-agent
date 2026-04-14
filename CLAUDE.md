@@ -105,11 +105,12 @@ Weather/disaster keyword detected in user message → `ProactiveCareEngine.proce
 - **Tools return dict or string** for LLM context consumption
 - **`_pending_original_context`** global injects user's original task into webhook events to prevent task abandonment after booking sync
 - **Prompt injection defense**: all `/chat` and `/webhook` inputs are scanned by `SkillSecurityGate.scan_user_input()` before processing
-- **LATM models**: `SKILL_MAKER_MODEL` (default: gpt-4o) for code synthesis + peer review; `SKILL_USER_MODEL` (default: gpt-4o-mini) for lightweight execution
+- **LLM backend**: Gemini via OpenAI-compatible endpoint (`https://generativelanguage.googleapis.com/v1beta/openai/`). Single helper `core/llm_client.py` — `get_llm_client()`, `get_default_model()`, `get_maker_model()`, `get_user_model()`. To switch back to OpenAI, set `OPENAI_BASE_URL=""` (empty) and use `gpt-*` models.
+- **LATM models**: `SKILL_MAKER_MODEL` (default: gemini-2.5-pro) for code synthesis + peer review; `SKILL_USER_MODEL` (default: gemini-2.5-flash) for lightweight execution
 - **Korean UI/commits**: project uses Korean for user-facing text and commit messages
 
 ## Environment
 
-Required in `.env`: `OPENAI_API_KEY`. Optional: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_USER_ID`, `SMTP_*`, `NAVER_ID/PW`, `MCP_SERVER_URL`, `OPENAI_MODEL` (default: gpt-4o), `SMITHERY_API_KEY` (Smithery MCP 레지스트리 API), `SERPER_API_KEY` (Google 웹 검색).
+Required in `.env`: `GEMINI_API_KEY` (from https://aistudio.google.com/apikey — or keep `OPENAI_API_KEY` as fallback). Optional: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_USER_ID`, `SMTP_*`, `NAVER_ID/PW`, `MCP_SERVER_URL`, `OPENAI_MODEL` (default: gemini-2.5-flash), `OPENAI_BASE_URL` (override LLM endpoint), `SMITHERY_API_KEY` (Smithery MCP 레지스트리 API), `SERPER_API_KEY` (Google 웹 검색).
 
 RSA keys (`.agent_private.pem`, `.agent_public.pem`) and certificates (`.agent_cert`) are generated during onboarding — not committed to git.

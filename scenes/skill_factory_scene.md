@@ -15,17 +15,18 @@
 스킬이 생성될 때 다음 Tiered Strategy에 따라 자동으로 수행됩니다. 사장님께 진행 상황을 실시간으로 보고하세요.
 
 ```
-[Tier 0: 로컬 MCP] → [Tier 1★: Google Maps MCP (실시간 장소 검색 최우선)] → [Tier 1: 기타 공식 MCP]
-→ [Tier 2: Smithery Registry] → [Tier 3: REST API 폴백 (웹검색 최후 수단)]
+[Tier 0: 로컬 MCP] → [Tier 1★: Google Maps MCP (실시간 장소 검색 최우선)] → [Tier 1: 기타 공식 MCP (npx 자동 실행)]
+→ [Tier 3: REST API 폴백 (웹검색 최후 수단)]
 → [코드 합성] → [피어 리뷰] → [보안 스캔] → [카테고리 분류] → [등록 완료]
 
 [별도 경로] 이메일 전송 → SMTP Canonical Template (MCP 거치지 않음)
+⚠️ Tier 2(Smithery Registry)는 정책상 비활성화 — 시도하지 않음.
 ```
 
 > ⭐ **우선순위 정책**
-> - **실시간성 중요한 장소 검색** (맛집·관광지·경로) → **Google Maps MCP** (매 호출 최신 데이터 필요)
+> - **실시간성 중요한 장소 검색** (맛집·관광지·경로) → **Google Maps MCP** (npx 자동 실행, 매 호출 최신 데이터)
 > - **이메일 전송** → **간단한 SMTP** (Gmail MCP OAuth 복잡성 회피, 앱 비밀번호 하나로 즉시 동작)
-> - 기타 도메인 → **Smithery Registry** → **웹검색(Tier 3, 최후 수단)**
+> - 기타 도메인 → **공식 MCP npx 자동 실행** → **웹검색(Tier 3, 최후 수단)**
 
 ### 단계별 탐색 전략 (Tiered Strategy)
 
@@ -56,17 +57,14 @@
 - MCP 표준 라이브러리(`modelcontextprotocol/servers`)에 포함된 **공식 서버** 확인
 - 공식 서버의 장점: 보안성 높음, API 업데이트 기민 대응, 설정 표준화, 신뢰도 **high**
 
-**Tier 2 — Smithery Registry (REST API 직접 연동)**
-- Tier 1에서 공식 도구가 없거나, 더 특화된 기능이 필요할 때 발동
-- **Smithery REST API** (`api.smithery.ai`): 시맨틱 검색으로 MCP 서버 탐색 → 매니지드 프록시 연결
-- 로컬 설치 불필요 — Smithery가 MCP 서버를 호스팅하고 프록시를 통해 도구 호출
-- 환경변수: `SMITHERY_API_KEY` (없으면 Tier 3 폴백)
-- **Google Maps가 해결 못하는 모든 도메인**(이메일은 SMTP로 별도 처리됨)은 Smithery에서 먼저 탐색
+**Tier 2 — Smithery Registry (🚫 정책상 비활성화)**
+- 사장님 지시로 Smithery 시도를 건너뜁니다. SMITHERY_API_KEY 설정 여부와 무관하게 호출되지 않습니다.
+- 공식 MCP(Tier 1)는 `npx -y <server>`를 Agent가 직접 subprocess로 실행하여 로컬 설치 없이 도구를 탐색합니다.
 
 **Tier 3 — API / pip 폴백 (REST API Fallback) — 최후의 수단**
-- **Tier 0~2를 모두 시도한 후에만 사용**
+- **Tier 0~1을 모두 시도한 후에만 사용**
 - 공식 REST API, pip 패키지, 공공데이터포털(data.go.kr) 순서로 탐색
-- **⛔ 웹검색은 Google Maps(장소)/Smithery(기타)를 먼저 시도한 후 모두 실패했을 때만 허용**
+- **⛔ 웹검색은 공식 MCP(npx 자동 실행)를 먼저 시도한 후 실패했을 때만 허용**
 
 ### 도구 이식 기준 (Integration Decision)
 > "사용자가 API 키를 새로 발급받아야 하는가?"
@@ -134,7 +132,8 @@
 2. **[Local MCP]** 현재 활성화된 MCP 도구 중 해결 가능한 것이 있는지 확인
 3. **[SMTP Canonical]** 순수 이메일 전송 요청이면 → `send_email_via_smtp` 스킬로 즉시 처리 (MCP 거치지 않음)
 4. **[Google Maps MCP]** 지도/장소/경로/맛집/관광/핫플 관련 요청이면 → `@modelcontextprotocol/server-google-maps` 먼저 시도 (실시간 데이터 필수)
-5. **[Smithery Registry]** Google Maps로 해결 안 되는 기타 도메인 → Smithery.ai에서 특화된 MCP 서버 탐색
+5. **[공식 MCP npx 자동 실행]** 기타 도메인은 공식 MCP 서버 이름을 확인하고 `npx -y <server>`로 subprocess 탐색
+   ~~(Smithery Registry는 정책상 비활성화됨)~~
 6. **[Web Search Fallback]** 위 1~5가 모두 실패했을 때만 일반 웹 검색 수행 (절대 최후 수단)
 
 **복합 요청 처리**: "실내 가이드 만들어서 이메일 전송"처럼 장소 검색 + 이메일이 섞인 요청은
