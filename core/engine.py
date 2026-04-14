@@ -1102,7 +1102,7 @@ async def dashboard():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Carrier-Grade Trust Dashboard</title>
+    <title>숙박 사업자용 Agent Dashboard</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -1197,8 +1197,8 @@ async def dashboard():
 
         /* ── Chat Panel ── */
         .chat-panel {
-            width: 420px; min-width: 250px; background: #ffffff; display: flex; flex-direction: column;
-            border-right: 1px solid #e2e8f0; flex-shrink: 0;
+            flex: 1; min-width: 250px; background: #ffffff; display: flex; flex-direction: column;
+            border-right: 1px solid #e2e8f0;
         }
         .chat-header {
             padding: 0.6rem 1.2rem; background: rgba(139, 92, 246, 0.04);
@@ -1405,43 +1405,10 @@ async def dashboard():
 </head>
 <body>
     <div class="header">
-        <h1>🔐 Carrier-Grade Trust Dashboard</h1>
+        <h1>🏨 숙박 사업자용 Agent Dashboard</h1>
         <div class="status">
             <div class="status-dot" id="statusDot"></div>
             <span id="statusText">대기 중</span>
-        </div>
-    </div>
-
-    <!-- Network Topology -->
-    <div class="topology">
-        <div class="topo-container">
-            <div class="topo-zone zone-public">
-                <span class="zone-label">☁️ Public Internet</span>
-                <div class="topo-node">🏨 Site A :8001</div>
-                <div class="topo-node">🧠 Agent C :8000</div>
-            </div>
-            <div class="topo-arrow">
-                <span class="arrow-label">VPAL</span>
-                <span class="arrow-line">═══►</span>
-                <div style="display:flex;gap:2px;">
-                    <div class="flow-dot"></div>
-                    <div class="flow-dot"></div>
-                    <div class="flow-dot"></div>
-                </div>
-            </div>
-            <div class="topo-zone zone-private">
-                <span class="zone-label">🔒 SKT Telco Private Slice (MEC Edge Zone)</span>
-                <div class="inner-row">
-                    <div class="topo-node">🔐 Telco D :8003</div>
-                    <div class="topo-vpal">
-                        <span>VPAL Tunnel</span>
-                        <div style="display:flex;gap:2px;">
-                            <div class="flow-dot"></div><div class="flow-dot"></div><div class="flow-dot"></div>
-                        </div>
-                    </div>
-                    <div class="topo-node">📅 Site B :8002</div>
-                </div>
-            </div>
         </div>
     </div>
 
@@ -1458,80 +1425,35 @@ async def dashboard():
                 <button class="chat-btn" style="background:transparent; border:1px solid #d1d5db; color:#64748b; font-size:0.6rem;" onclick="clearLogs()">로그 초기화</button>
             </div>
         </div>
-        <!-- Resizer -->
-        <div class="panel-resizer" id="panelResizer"></div>
-        <!-- Log Panel -->
-        <div class="log-panel">
-            <div class="log-header" onclick="toggleLogPanel()">
-                <div class="log-header-title">
-                    <span class="toggle-icon" id="logToggleIcon">▶</span>
-                    <span>🔍 실시간 Semantic Log</span>
-                </div>
-                <span><span id="logCount">0</span>건</span>
-            </div>
-            <div class="log-container collapsed" id="logContainer">
-                <div class="empty-state" id="emptyState">
-                    <div class="icon">📡</div>
-                    <p>시스템 이벤트 대기 중...</p>
-                    <p style="font-size:0.72rem;">채팅창에 명령을 입력하거나 Site A에서 이벤트를 생성하세요.</p>
-                </div>
-            </div>
-        </div>
     </div>
 
     <!-- Skill Library Panel -->
     <div class="skill-library-panel" id="skillLibraryPanel">
         <div class="skill-library-header" onclick="toggleSkillPanel()">
             <span>🧩 Skill Library — 등록된 스킬 <span id="skillCount">0</span>개</span>
-            <span class="toggle-icon" id="skillToggleIcon" style="font-size:0.6rem;">▶</span>
+            <span class="toggle-icon" id="skillToggleIcon" style="font-size:0.6rem;">▼</span>
         </div>
-        <div class="skill-cards" id="skillCards" style="display:none;"></div>
+        <div class="skill-cards" id="skillCards" style="display:flex;"></div>
     </div>
 
     <!-- Active Rules Panel -->
     <div class="rules-panel" id="rulesPanel">
         <div class="rules-header" onclick="toggleRulesPanel()">
             <span>⚡ Active Rules — 자동화 규칙 <span id="rulesCount">0</span>개</span>
-            <span class="toggle-icon" id="rulesToggleIcon" style="font-size:0.6rem;">▶</span>
+            <span class="toggle-icon" id="rulesToggleIcon" style="font-size:0.6rem;">▼</span>
         </div>
-        <div class="rules-cards" id="rulesCards" style="display:none;"></div>
-    </div>
-
-    <!-- Carrier Notary Table -->
-    <div class="notary-panel" id="notaryPanel">
-        <div class="notary-header">📜 Carrier Notary — 공증 기록 (실시간)</div>
-        <table class="notary-table">
-            <thead>
-                <tr>
-                    <th>타임스탬프</th>
-                    <th>이벤트</th>
-                    <th>인증 방식</th>
-                    <th>Agent</th>
-                    <th>정책/사유</th>
-                    <th>서명 유효성</th>
-                    <th>결과</th>
-                </tr>
-            </thead>
-            <tbody id="notaryBody">
-                <tr><td colspan="7" style="text-align:center;color:#484f58;padding:1rem;">공증 기록 없음</td></tr>
-            </tbody>
-        </table>
+        <div class="rules-cards" id="rulesCards" style="display:flex;"></div>
     </div>
 
     <div class="footer">
-        <span>Carrier-Grade Trust v0.2.0 · RS256 + VPAL + Kill-switch</span>
+        <span>숙박 사업자용 Agent Dashboard v0.2.0</span>
         <span id="clock"></span>
     </div>
 
     <script>
-        const container = document.getElementById('logContainer');
-        const emptyState = document.getElementById('emptyState');
-        const logCount = document.getElementById('logCount');
         const statusText = document.getElementById('statusText');
         const statusDot = document.getElementById('statusDot');
         const clock = document.getElementById('clock');
-        const notaryBody = document.getElementById('notaryBody');
-        let count = 0;
 
         function updateClock() { clock.textContent = new Date().toLocaleTimeString('ko-KR'); }
         setInterval(updateClock, 1000); updateClock();
@@ -1575,22 +1497,6 @@ async def dashboard():
             chatBody.scrollTop = chatBody.scrollHeight;
         }
 
-        async function clearLogs() {
-            try { await fetch('/logs/clear', { method: 'POST' }); } catch(err) {}
-            Array.from(container.children).forEach(child => {
-                if (child !== emptyState) container.removeChild(child);
-            });
-            if (emptyState) emptyState.style.display = 'flex';
-            count = 0;
-            logCount.textContent = '0';
-        }
-
-        function toggleLogPanel() {
-            const isCollapsed = container.classList.toggle('collapsed');
-            const icon = document.getElementById('logToggleIcon');
-            icon.textContent = isCollapsed ? '▶' : '▼';
-        }
-
         chatInput.addEventListener('keydown', (e) => {
             // 한글 조합 중 엔터 키 중복 발생 방지
             if (e.isComposing || e.keyCode === 229) return;
@@ -1601,76 +1507,7 @@ async def dashboard():
             }
         });
 
-        function addLog(entry) {
-            if (emptyState) emptyState.style.display = 'none';
-            count++; logCount.textContent = count;
-            const div = document.createElement('div');
-            div.className = 'log-entry ' + entry.type;
-            div.innerHTML =
-                '<span class="log-time">' + entry.timestamp + '</span>' +
-                '<span class="log-meta">' + escapeHtml(entry.meta) + '</span>' +
-                '<span class="log-content">' + escapeHtml(entry.content) + '</span>';
-            container.appendChild(div);
-            container.scrollTop = container.scrollHeight;
-
-            if (entry.type === 'webhook') { statusText.textContent = '[SITE A] 이벤트 수신'; statusDot.style.background = '#d29922'; }
-            else if (entry.type === 'thinking') { statusText.textContent = '[AGENT C] LLM 판단 중'; statusDot.style.background = '#bc8cff'; }
-            else if (entry.type === 'policy') { statusText.textContent = '[TELCO D] Policy Check'; statusDot.style.background = '#f59e0b'; }
-            else if (entry.type === 'vpal') { statusText.textContent = '[TELCO D] VPAL 세션 할당'; statusDot.style.background = '#38bdf8'; }
-            else if (entry.type === 'signature') { statusText.textContent = '[TELCO D] 서명 발행'; statusDot.style.background = '#a78bfa'; }
-            else if (entry.type === 'tool_call') { statusText.textContent = 'Tool 실행 중'; statusDot.style.background = '#79c0ff'; }
-            else if (entry.type === 'complete') { statusText.textContent = '대기 중'; statusDot.style.background = '#3fb950'; }
-            else if (entry.type === 'error') { statusText.textContent = '에러 발생'; statusDot.style.background = '#f85149'; }
-        }
-
         function escapeHtml(t) { const d = document.createElement('div'); d.textContent = t; return d.innerHTML; }
-
-        // SSE
-        const es = new EventSource('/logs/stream');
-        es.onmessage = (e) => { addLog(JSON.parse(e.data)); };
-        es.onerror = () => { statusText.textContent = '연결 끊김 — 재연결 중...'; statusDot.style.background = '#f85149'; };
-        fetch('/logs/history').then(r => r.json()).then(logs => logs.forEach(addLog));
-
-        // Notary polling
-        function loadNotary() {
-            fetch('http://localhost:8003/notary')
-                .then(r => r.json())
-                .then(data => {
-                    const records = data.records || [];
-                    if (records.length === 0) return;
-                    let html = '';
-                    records.slice().reverse().forEach(r => {
-                        const ts = (r.timestamp || '').substring(0, 19).replace('T', ' ');
-                        const evt = r.event || '';
-                        let badgeClass = 'badge-issued';
-                        if (evt.includes('denied') || evt.includes('isolated')) badgeClass = 'badge-denied';
-                        else if (evt.includes('registered')) badgeClass = 'badge-registered';
-                        else if (evt.includes('reactivated')) badgeClass = 'badge-reactivated';
-
-                        const authMethod = evt === 'agent_registered' ? 'USIM PIN' : 'Policy 자동';
-                        const policy = r.policy_matched || r.policies || r.reason || '-';
-                        const sigValid = (evt === 'token_issued' || evt === 'agent_registered') ? '✅ Valid' : (evt.includes('denied') ? '❌ N/A' : '–');
-                        const result = (evt === 'token_issued') ? '🟢 발급' :
-                                       (evt === 'agent_registered') ? '🔵 등록' :
-                                       (evt.includes('isolated')) ? '🔴 격리' :
-                                       (evt.includes('reactivated')) ? '🟢 복구' :
-                                       (evt.includes('denied')) ? '🔴 거부' : '–';
-
-                        html += '<tr>' +
-                            '<td style="color:#64748b;">' + ts + '</td>' +
-                            '<td><span class="notary-badge ' + badgeClass + '">' + evt + '</span></td>' +
-                            '<td>' + authMethod + '</td>' +
-                            '<td>' + (r.agent_id || '-') + '</td>' +
-                            '<td style="color:#94a3b8;">' + policy + '</td>' +
-                            '<td>' + sigValid + '</td>' +
-                            '<td>' + result + '</td></tr>';
-                    });
-                    notaryBody.innerHTML = html;
-                })
-                .catch(() => {});
-        }
-        loadNotary();
-        setInterval(loadNotary, 3000);
 
         // Skill Library
         function toggleSkillPanel() {
@@ -1722,38 +1559,6 @@ async def dashboard():
 
         loadSkills();
         setInterval(loadSkills, 5000);
-
-        // ── Panel Resizer ──
-        (function() {
-            const resizer = document.getElementById('panelResizer');
-            const chatPanel = document.getElementById('chatPanel');
-            let isResizing = false;
-
-            resizer.addEventListener('mousedown', (e) => {
-                isResizing = true;
-                resizer.classList.add('active');
-                document.body.style.cursor = 'col-resize';
-                document.body.style.userSelect = 'none';
-                e.preventDefault();
-            });
-
-            document.addEventListener('mousemove', (e) => {
-                if (!isResizing) return;
-                const newWidth = e.clientX;
-                if (newWidth >= 250 && newWidth <= window.innerWidth - 300) {
-                    chatPanel.style.width = newWidth + 'px';
-                }
-            });
-
-            document.addEventListener('mouseup', () => {
-                if (isResizing) {
-                    isResizing = false;
-                    resizer.classList.remove('active');
-                    document.body.style.cursor = '';
-                    document.body.style.userSelect = '';
-                }
-            });
-        })();
 
         // ── Active Rules ──
         function toggleRulesPanel() {
