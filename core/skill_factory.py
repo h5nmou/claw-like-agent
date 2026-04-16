@@ -719,6 +719,13 @@ MCP 레지스트리(Smithery.ai, Awesome-MCP) 검색 결과:
         사용 가능한 도구 목록을 가져오고, 요청에 맞는 도구가 있으면
         웹 검색 없이 즉시 MCP 전략을 반환한다.
         """
+        # PHONE_MCP_ENABLED=false 면 프로빙 자체 생략
+        if os.getenv("PHONE_MCP_ENABLED", "true").strip().lower() == "false":
+            await _log("system",
+                "⏭️ 로컬 MCP 프로빙 생략 (PHONE_MCP_ENABLED=false)",
+                "[MCP 프로빙 생략]")
+            return None
+
         mcp_url = os.getenv("MCP_SERVER_URL", "http://192.168.0.20:8080")
         if not mcp_url:
             await _log("system",

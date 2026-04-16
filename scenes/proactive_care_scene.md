@@ -208,14 +208,73 @@ STEP 5: 자동화 등록 질문 (사장님 승인 필수)
 3. **다음 STEP으로 넘어가지 말고 현재 STEP에서 멈출 것**
 4. 사장님이 설정 완료하면 `reload_env` 호출 후 현재 STEP 재시도
 
-### propose_care_automation 호출 방법 (STEP 5에서 사용)
+### ⭐ 작업 순서 (CRITICAL — 이 순서를 어기면 안 됨)
+사용자 요청에 "가이드/추천/검색/맛집/관광/카페/핫플/실내" 같은 데이터 수집 의도가 있고 이메일 전송도 함께 요구되었다면, **반드시 아래 정확한 순서**대로 수행한다.
+
+**STEP 1. MCP 기반 가이드 스킬 생성** (`create_new_skill`)
+- user_request에는 데이터 수집 목적을 명확히: "제주 애월읍 주변 실내 핫플레이스(카페·맛집·관광지) 검색 가이드 생성" 등.
+- ⛔ 이 단계 전에 이메일 스킬(`send_email_via_smtp`)을 먼저 만들지 마라. 엔진이 차단한다.
+
+**STEP 2. 가이드 스킬 호출 → 실시간 데이터 확보**
+- STEP 1에서 만든 스킬을 즉시 tool_call로 호출.
+- 결과(장소 리스트)를 변수처럼 보관.
+
+**STEP 3. 이메일 스킬 준비** (`create_new_skill`로 send_email_via_smtp 생성)
+- STEP 2가 끝난 뒤에만 호출.
+
+**STEP 4. 이메일 전송** (`send_email_via_smtp`)
+- body에는 STEP 2의 가이드 결과를 그대로 담아서 전송.
+- ⛔ MCP 가이드 스킬 호출 없이 send_email_via_smtp를 호출하면 엔진이 차단한다.
+- env_key_required(SMTP_PASSWORD 미설정) 응답이면 사장님께 안내 후 '설정 완료' 응답을 기다린다.
+
+**STEP 5. propose_care_automation 호출** — 자동화 등록 질문
+- ⛔ STEP 4가 성공한 뒤에만 호출 가능. 엔진이 검증한다.
+- skill_sequence는 **STEP 1·2의 가이드 스킬 + STEP 4의 이메일 스킬**을 모두 순서대로 포함해야 한다.
+
+**자동 실행 모드(Active Rule 발동)에서는** skill_sequence를 그대로 순차 실행하면 되므로 STEP 1/3은 건너뛰고 STEP 2/4만 수행. propose_care_automation은 호출하지 않는다 (이미 등록된 규칙이므로).
+   - 만약 `env_key_required`/`error` 응답이 오면 **사용자에게 설정 안내 메시지만 전달하고 작업을 일시 중단**
+   - 예: "🔑 이메일 전송을 위해 SMTP_PASSWORD가 필요합니다. `.env`에 추가 후 '설정 완료'라고 알려주세요."
+   - ⛔ 이메일이 실패/대기 상태인데 절대로 `propose_care_automation`을 호출하지 마라
+3. **이메일 성공 확인** (tool result에 error/env_key_required/결과없음 없음)
+4. **그제서야 `propose_care_automation` 호출** — 자동화 등록 질문
+
+**자가 점검**: propose_care_automation을 호출하기 직전에 반드시 스스로 묻는다:
+- [ ] send_email_via_smtp 호출이 있었는가?
+- [ ] 마지막 이메일 tool result가 성공인가? (env_key_required 없음, error 없음)
+- 둘 다 YES인 경우에만 propose_care_automation 호출. 하나라도 NO면 호출 금지.
+
+### ⛔ 케어 제안 카드 중복 전송 금지 (CRITICAL)
+weather_changed webhook 이벤트로 케어 분석이 시작된 경우, 시스템이 **이미 사장님께 케어 제안 카드 + 승인 버튼을 자동으로 전송**했습니다.
+- LLM은 동일한 케어 제안 내용을 `send_telegram_message`로 **다시 보내지 마라.**
+- 사장님의 승인 응답(care_1, care_2 등)을 기다리거나, 자동 실행 모드면 시퀀스를 실행하라.
+
+마찬가지로 `propose_care_automation` 호출이 성공하면 시스템이 **이미 자동화 등록 질문 카드를 사장님께 표시**했다.
+- LLM은 동일한 자동화 등록 질문을 `send_telegram_message`로 **다시 보내지 마라.**
+- propose_care_automation 응답을 받았으면 텍스트 응답으로 종료하거나 다음 작업을 진행하라.
+
+### propose_care_automation 호출 방법 (STEP 5)
+작업 완료 후 사장님께 "자동화 등록할까요?" 질문을 띄우기 위해 호출한다.
 ```
-trigger_category: 감지된 트리거 카테고리 (예: "heavy_rain")
+trigger_category: 아래 7개 중 하나를 선택:
+  • rain       — 일반 비 올 때 반복 실행
+  • heavy_rain — 폭우 올 때 반복 실행
+  • snow       — 눈 올 때 반복 실행
+  • wind       — 강풍 불 때 반복 실행
+  • heat       — 폭염 일 때 반복 실행
+  • cold       — 한파 일 때 반복 실행
+  • general    — 날씨와 무관한 사용자 요청 (예: "가이드 + 이메일 전송")
+                 ⚠️ general로 등록된 규칙은 날씨 webhook으로 자동 발동되지 않음.
+                   대시보드에 기록되어 참고용으로만 쓰이거나, 사장님이 수동 재요청 시 재사용.
 approved_action: 승인된 액션 설명 (예: "폭우 시 실내 관광지 가이드 제작 및 이메일 발송")
 skill_name: 실행에 사용된 대표 스킬명 (하위호환용, 선택)
 condition_description: 자동화 조건 설명 (예: "날씨가 맑음→비로 변경되고 해당 날짜 투숙객이 있는 경우")
 skill_sequence: ⭐ [필수] 실제로 사용자 요청을 완료시킨 "최종 성공 스킬 호출 시퀀스"
 ```
+
+### 트리거 카테고리 선택 규칙
+- **Webhook 이벤트로 시작된 케어**: 해당 이벤트의 날씨 카테고리(`rain`·`heavy_rain`·`snow` 등)를 그대로 사용
+- **사용자가 채팅으로 직접 요청한 일회성 작업**: `general` 사용 (저장은 되지만 날씨 webhook으로 자동 발동 안 됨)
+- **반대 전환 주의**: 등록 시점이 "비 올 때"라면 반드시 `rain`이나 `heavy_rain`을 쓰고 절대 그냥 `general`을 쓰지 마라. general을 쓰면 "비→맑음" 전환에도 매칭 시도되지는 않지만 반복 자동화 혜택을 못 받는다.
 
 ### ⭐ skill_sequence — 최종 성공한 동작만 저장하는 규칙 (CRITICAL)
 

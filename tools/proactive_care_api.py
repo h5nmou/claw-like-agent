@@ -241,6 +241,14 @@ async def propose_care_automation(
     if skill_sequence is None:
         skill_sequence = []
 
+    # ── trigger_category 정규화: 알 수 없는 값은 "general"로 수용 ──
+    # "general" 규칙은 저장은 허용하되 get_auto_rules()에서 자동 매칭에서 제외된다.
+    # (날씨 webhook이 비→맑음 같은 반대 전환에서도 "general" 규칙을 발동시키는 오동작 방지)
+    VALID_CATEGORIES = {"rain", "heavy_rain", "snow", "wind", "heat", "cold", "general"}
+    if trigger_category not in VALID_CATEGORIES:
+        # 완전히 알 수 없는 값이면 general로 교정
+        trigger_category = "general"
+
     # 대기 중인 규칙 정보 저장
     save_pending_auto_rule(
         trigger_category=trigger_category,

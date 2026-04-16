@@ -357,14 +357,11 @@ async def index():
 <body>
     <div class="container">
         <h1>🏨 Site A — 예약 관리 ({PROPERTY_LOCATION})</h1>
-        <p class="subtitle">📍 {PROPERTY_LOCATION} · 예약 생성 시 Engine에 Webhook 전송 · 5초마다 자동 새로고침</p>
 
         <div class="card" id="weather-section">
-            <h2>🌤️ 현재 날씨</h2>
             <div style="display:flex; align-items:center; gap:1.5rem; margin-top:0.5rem;">
                 <span id="weather-display" style="font-size:2.5rem;">{w_label}</span>
                 <div style="display:flex; flex-direction:column; gap:0.5rem; flex:1;">
-                    <label style="font-size:0.8rem; color:#94a3b8;">날씨 변경 (Engine에 Webhook 전송)</label>
                     <div style="display:flex; gap:0.5rem;">
                         <select id="weather-select" style="flex:1; background:#ffffff; border:1px solid #d1d5db; border-radius:8px; padding:0.6rem; color:#1e293b; font-size:0.9rem;">
                             {weather_options_html}
@@ -376,7 +373,6 @@ async def index():
         </div>
 
         <div class="card" id="calendar-section">
-            <h2>📅 가용 현황</h2>
             {calendar_html}
         </div>
 
@@ -429,7 +425,7 @@ async def index():
         try {{
             const resp = await fetch('/partial');
             const data = await resp.json();
-            document.getElementById('calendar-section').innerHTML = '<h2>📅 가용 현황</h2>' + data.calendar_html;
+            document.getElementById('calendar-section').innerHTML = data.calendar_html;
             document.getElementById('booking-list').innerHTML = data.bookings_html;
             document.getElementById('weather-display').textContent = data.weather_label;
         }} catch(e) {{}}

@@ -265,6 +265,7 @@ async def send_telegram_message(message: str, buttons: list[str] = None) -> dict
                 "inline_keyboard": keyboard
             }
 
+    # telegram_client.send_message 내부에서 대시보드 푸시를 자동 처리
     result = await telegram_client.send_message(message, reply_markup=reply_markup)
     return {"status": "success", "response": result} if "error" not in result else result
 

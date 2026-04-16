@@ -364,23 +364,23 @@ class ProactiveCareEngine:
         return "\n".join(lines)
 
     def format_care_telegram_buttons(self, analysis: dict) -> dict:
-        """케어 제안을 텔레그램 인라인 버튼으로 포맷."""
+        """케어 제안을 텔레그램 인라인 버튼으로 포맷.
+
+        버튼 라벨에는 제안의 action 전체 문장을 그대로 담는다.
+        텔레그램은 라벨이 길면 자체적으로 줄바꿈/자름 처리하고,
+        대시보드에서는 CSS(text-overflow:ellipsis)로 가변 말줄임한다.
+        """
         proposals = analysis.get("proposals", [])
         buttons = []
 
         for i, p in enumerate(proposals, 1):
-            # 텔레그램 버튼 텍스트는 짧게
-            action_short = p["action"][:25] + ".." if len(p["action"]) > 25 else p["action"]
+            label = f"{i}. {p.get('action', '')}".strip()
             buttons.append([{
-                "text": f"{i}. {action_short}",
+                "text": label,
                 "callback_data": f"care_{i}",
             }])
 
-        if len(proposals) > 1:
-            buttons.append([{
-                "text": "✅ 전체 실행",
-                "callback_data": "care_all",
-            }])
+        # 전체 실행 버튼은 제공하지 않음 (사장님 지시) — 개별 제안만 승인
 
         buttons.append([{
             "text": "❌ 무시",
@@ -455,13 +455,28 @@ class ProactiveCareEngine:
 
         return promoted
 
-    def get_auto_rules(self, trigger_category: str) -> list[dict]:
-        """특정 트리거에 대해 자동 실행 가능한 규칙 목록 반환."""
+    def get_auto_rules(self, trigger_category: str, current_condition: str = "") -> list[dict]:
+        """특정 트리거에 대해 자동 실행 가능한 규칙 목록 반환.
+
+        매칭 정책:
+          1) trigger_category가 정확히 일치해야 한다 (rain, heavy_rain, snow ...).
+          2) "general" 카테고리는 더 이상 자동 매칭되지 않는다 (오발동 방지).
+          3) current_condition이 명시되면 'sunny'/'cloudy' 같은 평온한 상태에서는
+             어떤 위험 카테고리(rain/snow/wind/heat/cold) 규칙도 발동하지 않는다.
+        """
+        # 평온한 날씨로 전환된 경우 — 위험 카테고리 자동 규칙은 무시
+        BENIGN = {"sunny", "cloudy", "clear", "fair"}
+        if current_condition and current_condition.lower() in BENIGN:
+            return []
+        # general 카테고리는 자동 매칭에서 제외 (모든 변화에 발동되는 부작용 차단)
+        if not trigger_category or trigger_category == "general":
+            return []
         rules = _load_rules()
         return [
             r for r in rules
             if r.get("auto_execute")
             and r["trigger_category"] == trigger_category
+            and r["trigger_category"] != "general"
         ]
 
     def get_all_rules(self) -> list[dict]:
@@ -522,12 +537,12 @@ class ProactiveCareEngine:
             "[선제적 케어]",
         )
 
-        # 자동 실행 규칙 확인
-        auto_actions = self.get_auto_rules(category)
+        # 자동 실행 규칙 확인 (현재 weather 카테고리와 정확히 일치하는 것만)
+        auto_actions = self.get_auto_rules(category, current_condition=weather_condition)
         if auto_actions:
             await _emit(
                 "system",
-                f"⚡ [Active Rule] {len(auto_actions)}개 자동 실행 규칙 발견",
+                f"⚡ [Active Rule] {len(auto_actions)}개 자동 실행 규칙 발견 ({weather_condition})",
                 "[자동화]",
             )
 

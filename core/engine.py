@@ -60,6 +60,8 @@ onboarding_mgr = OnboardingManager()
 _pending_original_context = None  # type: dict | None
 
 # Phone-MCP 설정
+# PHONE_MCP_ENABLED=false 로 설정하면 연결 시도를 완전히 생략한다.
+PHONE_MCP_ENABLED = os.getenv("PHONE_MCP_ENABLED", "true").strip().lower() != "false"
 MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://192.168.0.20:8080")
 mcp_client = MCPClient(MCP_SERVER_URL)
 
@@ -95,11 +97,21 @@ async def startup_onboarding():
 async def startup_mcp_tools():
     """Phone-MCP 서버에서 원격 Tool 목록 동기화."""
     await broadcaster.emit("divider", "PHASE 0.5 — Phone-MCP 연동", "")
+
+    if not PHONE_MCP_ENABLED:
+        logger.info("Phone-MCP disabled via PHONE_MCP_ENABLED=false. Skipping connection.")
+        await broadcaster.emit(
+            "system",
+            "⏭️ Phone-MCP 연동 건너뜀 (PHONE_MCP_ENABLED=false)",
+            "⚙️ MCP 연동",
+        )
+        return
+
     await broadcaster.emit("system", f"📱 Phone-MCP ({MCP_SERVER_URL}) 연결 시도 중...", "⚙️ MCP 연동")
-    
+
     # Tool 목록 가져오기 및 등록
     await mcp_client.fetch_and_register_tools()
-    
+
     # 등록된 도구 확인을 위해 잠시 대기
     from core.executor import get_registered_tools
     all_tools = get_registered_tools()
@@ -353,7 +365,7 @@ async def handle_telegram_message(text: str, chat_id: str):
             )
         return
 
-    elif text == "auto_rule_no" or text in ("등록 안함", "자동화 안함", "No", "[등록 안함]", "[자동화 안함]"):
+    elif text == "auto_rule_no" or text.strip().lstrip("✅❌📋🔧").strip().strip("[]").strip() in ("등록 안함", "자동화 안함", "No"):
         pending_rule = get_pending_auto_rule()
         clear_pending_auto_rule()
         await broadcaster.emit(
@@ -365,9 +377,9 @@ async def handle_telegram_message(text: str, chat_id: str):
         )
         return
 
-    # ── 자동화 등록 텍스트 버튼 fallback (LLM이 propose_care_automation 대신 send_telegram_message를 쓴 경우) ──
-    # 대괄호 포함 변형([자동화 등록])도 처리
-    elif text.strip("[]") in ("자동화 등록", "Yes", "등록"):
+    # ── 자동화 등록 텍스트 버튼 fallback ──
+    # 대괄호([자동화 등록]) / 이모지(✅ 자동화 등록) prefix 모두 허용
+    elif text.strip().lstrip("✅❌📋🔧").strip().strip("[]").strip() in ("자동화 등록", "Yes", "등록"):
         pending_rule = get_pending_auto_rule()
         if pending_rule:
             clear_pending_auto_rule()
@@ -430,6 +442,7 @@ async def handle_telegram_message(text: str, chat_id: str):
                     "analysis": care_result["analysis"],
                 }
             event["proactive_care_context"] = care_result["analysis"]
+            event["_skip_dashboard_echo"] = True  # 대시보드에 케어 카드 이미 푸시됨
 
     # 원본 사용자 요청을 전역 컨텍스트에 보관 (Webhook이 발생하면 주입됨)
     _pending_original_context = {
@@ -852,11 +865,182 @@ async def run_agent_loop(trigger_event: dict) -> dict:
         logger.info(f"Brain response type: {response['type']}")
 
         if response["type"] == "text":
+            # ── 자가 점검 유틸: tool_calls 히스토리에서 특정 도구 호출 여부 확인 ──
+            def _tool_was_called(tool_name: str) -> bool:
+                for _m in brain._messages:
+                    if _m.get("role") == "assistant":
+                        for _tc in (_m.get("tool_calls") or []):
+                            if (_tc.get("function") or {}).get("name") == tool_name:
+                                return True
+                return False
+
+            def _tool_last_succeeded(tool_name: str) -> bool:
+                """가장 최근 `tool_name` 호출 결과가 성공(error/env_key_required/결과없음 없음)인지."""
+                last_call_idx = -1
+                last_call_id = None
+                for _i, _m in enumerate(brain._messages):
+                    if _m.get("role") == "assistant":
+                        for _tc in (_m.get("tool_calls") or []):
+                            if (_tc.get("function") or {}).get("name") == tool_name:
+                                last_call_idx = _i
+                                last_call_id = _tc.get("id")
+                if last_call_idx < 0:
+                    return False
+                for _m in brain._messages[last_call_idx + 1:]:
+                    if _m.get("role") == "tool" and _m.get("tool_call_id") == last_call_id:
+                        _content = _m.get("content", "")
+                        try:
+                            _parsed = json.loads(_content) if isinstance(_content, str) else _content
+                        except Exception:
+                            return True  # 파싱 실패는 단순 텍스트 결과 → 성공으로 간주
+                        if isinstance(_parsed, dict):
+                            if (_parsed.get("error") or _parsed.get("env_key_required")
+                                    or _parsed.get("결과없음") or _parsed.get("status") == "rejected"):
+                                return False
+                            # send_email_via_smtp의 성공 응답은 status/response에 담김
+                            return True
+                        return True
+                return False  # tool result 아직 없음 → 성공으로 단정 안 함
+
+            _intent_text = " ".join([
+                str(trigger_event.get("message") or ""),
+                str((trigger_event.get("original_context") or {}).get("original_message") or ""),
+                str(trigger_event.get("event_message") or ""),
+                json.dumps(trigger_event.get("proactive_care") or {}, ensure_ascii=False),
+            ])
+
+            # ── ① 이메일 누락 보정 ──
+            _email_intent = any(k in _intent_text for k in [
+                "이메일", "메일 전송", "메일 발송", "이메일로", "메일로", "send email", "email"
+            ])
+            _email_called = _tool_was_called("send_email_via_smtp")
+
+            # env_key_required(SMTP_PASSWORD 미설정) 감지 → 사용자에게 설정 안내 자동 푸시
+            _smtp_nudged = getattr(brain, "_smtp_setup_nudged", False)
+            if _email_called and not _tool_last_succeeded("send_email_via_smtp") and not _smtp_nudged:
+                # 가장 최근 이메일 tool 결과가 env_key_required인지 확인
+                for _m in reversed(brain._messages):
+                    if _m.get("role") == "tool":
+                        try:
+                            _r = json.loads(_m.get("content") or "{}")
+                        except Exception:
+                            _r = {}
+                        if isinstance(_r, dict) and _r.get("env_key_required") == "SMTP_PASSWORD":
+                            brain._smtp_setup_nudged = True
+                            await broadcaster.emit(
+                                "external_result",
+                                (
+                                    "🔑 이메일 전송에 필요한 설정이 누락되었습니다.\n\n"
+                                    "Gmail 앱 비밀번호를 발급받아 `.env` 파일에 추가해주세요:\n"
+                                    "  SMTP_PASSWORD=발급받은_16자리_앱비밀번호\n\n"
+                                    "설정 후 채팅창에 '설정 완료'라고 입력하시면 즉시 이메일을 재전송합니다."
+                                ),
+                                "[SMTP 설정 필요]",
+                            )
+                            break
+                # 이메일이 실패한 상태 → propose nudge로 넘어가지 않도록 그대로 종료 허용
+                final_summary = response["content"] or ""
+                memory.add_event("assistant", final_summary)
+                logger.info(f"Agent completed (SMTP 설정 대기): {final_summary[:100]}...")
+                await broadcaster.emit("complete", final_summary, "✅ 작업 완료")
+                break
+
+            _already_nudged = getattr(brain, "_email_nudged", False)
+            if _email_intent and not _email_called and not _already_nudged:
+                brain._email_nudged = True
+                logger.info("[Email-Nudge] 이메일 의도 감지되었으나 send_email_via_smtp 호출 누락 — 강제 재촉")
+                await broadcaster.emit(
+                    "system",
+                    "📨 이메일 전송 단계가 누락된 것 같습니다. 자동으로 한 번 더 안내합니다.",
+                    "[이메일 누락 보정]",
+                )
+                brain.add_user_message(
+                    "⛔ 작업이 아직 끝나지 않았습니다. 사용자 요청에 '이메일 전송'이 포함되어 있는데 "
+                    "지금까지 send_email_via_smtp 도구를 호출하지 않았습니다. "
+                    "지금 즉시 send_email_via_smtp(to_email, subject, body)를 tool_call로 호출하여 "
+                    "방금 만든 가이드/결과를 투숙객에게 발송하세요. 텍스트 응답하지 말고 곧바로 도구를 호출하세요."
+                )
+                continue
+
+            # ── ② 자동화 제안 누락 보정 ──
+            # 순서: 사용자 요청 작업(이메일 포함)이 **성공**해야만 자동화 등록 질문 재촉.
+            # - 이메일 의도가 있으면 send_email_via_smtp가 성공한 경우에만 허용
+            #   (env_key_required 등 실패 상태에서는 절대 propose 재촉 금지 — SMTP_PASSWORD 안내가 먼저 가야 함)
+            # - 이메일 의도가 없으면 생성/검색 스킬이라도 성공했는지 확인
+            _propose_called = _tool_was_called("propose_care_automation")
+            _email_ok = _tool_last_succeeded("send_email_via_smtp") if _email_intent else True
+
+            _other_action_succeeded = False
+            if not _email_intent:
+                for _m in brain._messages:
+                    if _m.get("role") == "assistant":
+                        for _tc in (_m.get("tool_calls") or []):
+                            _name = (_tc.get("function") or {}).get("name", "")
+                            if _name.startswith(("generate_", "create_", "recommend_", "search_", "find_")):
+                                if _tool_last_succeeded(_name):
+                                    _other_action_succeeded = True
+                                    break
+                    if _other_action_succeeded:
+                        break
+
+            _real_action_ok = _email_ok if _email_intent else _other_action_succeeded
+            _propose_nudged = getattr(brain, "_propose_nudged", False)
+            # ⛔ 자동 실행 모드(이미 등록된 Active Rule 발동)에서는 propose 재촉 금지
+            #    — 이미 등록된 규칙을 수행 중인데 또 등록 질문 띄우면 무한 반복
+            _is_auto_execute = bool((trigger_event.get("proactive_care") or {}).get("auto_actions"))
+            if _real_action_ok and not _propose_called and not _propose_nudged and not _is_auto_execute:
+                brain._propose_nudged = True
+                logger.info("[Propose-Nudge] 작업 완료 후 propose_care_automation 호출 누락 — 강제 재촉")
+                await broadcaster.emit(
+                    "system",
+                    "📋 자동화 등록 질문이 누락된 것 같습니다. 자동으로 한 번 더 안내합니다.",
+                    "[자동화 제안 보정]",
+                )
+                # trigger_category 힌트: 케어 webhook 이벤트면 해당 카테고리, 아니면 general
+                _care_ctx = trigger_event.get("proactive_care") or {}
+                _cat_hint = ""
+                if isinstance(_care_ctx, dict):
+                    _aa = _care_ctx.get("auto_actions") or []
+                    if _aa and isinstance(_aa[0], dict):
+                        _cat_hint = _aa[0].get("trigger_category", "")
+                if not _cat_hint:
+                    _weather = (trigger_event.get("weather") or {}).get("current", "")
+                    _cat_hint = {"rain": "rain", "heavy_rain": "heavy_rain", "snow": "snow"}.get(_weather, "general")
+                brain.add_user_message(
+                    "⛔ 작업이 아직 끝나지 않았습니다. 방금 투숙객 관련 작업(가이드 제작/이메일 발송 등)을 완료했지만 "
+                    "사장님에게 '이 작업을 자동화 규칙으로 등록할지' 질문하지 않았습니다. "
+                    "지금 즉시 propose_care_automation 도구를 tool_call로 호출하세요. "
+                    f"trigger_category는 '{_cat_hint}'를 사용하세요 (날씨 이벤트면 해당 카테고리, 일반 채팅 요청이면 'general'). "
+                    "approved_action에는 방금 수행한 작업의 요약을, skill_sequence에는 실제로 성공했던 스킬 호출만 순서대로 넣으세요. "
+                    "텍스트 응답하지 말고 곧바로 도구를 호출하세요."
+                )
+                continue
+
             # LLM이 텍스트로 응답 → 루프 종료
             final_summary = response["content"]
             memory.add_event("assistant", final_summary)
             logger.info(f"Agent completed: {final_summary[:100]}...")
             await broadcaster.emit("complete", final_summary, "✅ 작업 완료")
+            # 대시보드 채팅창 푸시 — /chat 경로가 아닌 외부 트리거(site_a/webhook/telegram)의 결과를
+            # 대시보드 채팅창에도 표시한다. /chat 경로는 이미 response로 반환되므로 제외.
+            # hotel_sync_scene 규칙상 Site A 예약 동기화는 "조용히 수행" — LLM이 "..." 같은
+            # placeholder만 응답하는 경우가 많으므로 의미 있는 메시지만 푸시한다.
+            _src = trigger_event.get("source") or ""
+            _summary_clean = (final_summary or "").strip().strip(".").strip()
+            _is_meaningful = len(_summary_clean) >= 10
+            # 이미 케어 제안 메시지가 대시보드에 푸시된 상태면 최종 요약 중복 전송 방지
+            _already_pushed = bool(trigger_event.get("_skip_dashboard_echo"))
+            if _src and _src != "dashboard_chat" and _is_meaningful and not _already_pushed:
+                _label = {
+                    "site_a": "🏨 Site A",
+                    "telegram": "📲 Telegram",
+                    "webhook": "🔔 Webhook",
+                }.get(_src, f"🔔 {_src}")
+                await broadcaster.emit(
+                    "external_result",
+                    f"[{_label}] {final_summary}",
+                    "대시보드 알림",
+                )
             break
 
         elif response["type"] == "tool_calls":
@@ -887,6 +1071,147 @@ async def run_agent_loop(trigger_event: dict) -> dict:
                     json.dumps({"function": tool_name, "arguments": tool_args}, ensure_ascii=False, indent=2),
                     f"🔧 {role_label} Tool 호출: {tool_name}"
                 )
+
+                # ── 순서 가드: 이메일 전송 성공 전에 propose_care_automation 호출 금지 ──
+                # 사용자 요청에 이메일 의도가 있으면 send_email_via_smtp가 성공한 뒤에만 자동화 질문을 띄운다.
+                _intent_text = " ".join([
+                    str(trigger_event.get("message") or ""),
+                    str((trigger_event.get("original_context") or {}).get("original_message") or ""),
+                    str(trigger_event.get("event_message") or ""),
+                    json.dumps(trigger_event.get("proactive_care") or {}, ensure_ascii=False),
+                ])
+                _has_email_intent = any(k in _intent_text for k in [
+                    "이메일", "메일 전송", "메일 발송", "이메일로", "메일로", "send email", "email"
+                ])
+                _has_guide_intent = any(k in _intent_text for k in [
+                    "가이드", "추천", "맛집", "관광", "카페", "핫플", "장소 검색", "실내"
+                ])
+
+                # ── Order-Guard 보조: 이미 호출된 도구 분석 ──
+                _called_names = [
+                    (_tc.get("function") or {}).get("name", "")
+                    for _m in brain._messages if _m.get("role") == "assistant"
+                    for _tc in (_m.get("tool_calls") or [])
+                ]
+                _guide_skill_called = any(
+                    n.startswith(("generate_", "create_", "recommend_", "search_", "find_"))
+                    and n != "create_new_skill"
+                    for n in _called_names
+                )
+                _is_auto_run = bool((trigger_event.get("proactive_care") or {}).get("auto_actions"))
+
+                # Order-Guard 0: create_new_skill 호출 시 — 가이드 의도가 있는데 아직 가이드 스킬이
+                # 호출되지 않았으면 이메일 스킬을 먼저 만들지 못하게 한다.
+                if tool_name == "create_new_skill" and _has_guide_intent and not _guide_skill_called and not _is_auto_run:
+                    _req = (tool_args.get("user_request") or "").lower()
+                    _is_email_skill_request = any(k in _req for k in [
+                        "smtp", "send_email", "이메일", "메일 전송", "메일 발송", "gmail"
+                    ])
+                    if _is_email_skill_request:
+                        logger.warning(
+                            "[Order-Guard] create_new_skill(이메일 스킬) 차단 — 가이드 스킬 먼저 필요"
+                        )
+                        await broadcaster.emit(
+                            "system",
+                            "⛔ 이메일 스킬 생성을 차단했습니다. 먼저 MCP 기반 가이드 스킬을 생성·호출하세요.",
+                            "[순서 가드]",
+                        )
+                        result = {
+                            "status": "blocked",
+                            "error": "가이드 스킬을 먼저 생성·실행한 뒤에 이메일 스킬을 만드세요.",
+                            "hint": (
+                                "사용자 요청 순서: ① MCP 기반 가이드 스킬 생성 → ② 그 스킬 호출로 데이터 수집 "
+                                "→ ③ 이메일 스킬 생성(없으면) → ④ 이메일 전송. "
+                                "지금은 ①~②가 끝나야 합니다. "
+                                "create_new_skill을 다시 호출하되 user_request에 "
+                                "'제주 애월읍 주변 실내 핫플레이스(카페·맛집·관광지) 검색 가이드 생성' 같은 "
+                                "MCP 기반 가이드 스킬을 요청하세요."
+                            ),
+                        }
+                        result_str = json.dumps(result, ensure_ascii=False, indent=2)
+                        brain.add_tool_result(tool_call["id"], result)
+                        logger.info(f"Tool result: {result_str}")
+                        memory.add_event("tool_result", {"name": tool_name, "result": result})
+                        continue
+
+                # Order-Guard A: 가이드 의도가 있는데 MCP 기반 스킬이 한 번도 실행되지 않았다면
+                # send_email_via_smtp 호출 차단 — 고정된 텍스트로 이메일 보내는 것 방지
+                if tool_name == "send_email_via_smtp" and _has_guide_intent:
+                    # 자동 실행 모드면 스킵 (이미 skill_sequence에 따라 실행 중)
+                    if not _is_auto_run and not _guide_skill_called:
+                        logger.warning(
+                            "[Order-Guard] send_email_via_smtp 차단 — MCP 가이드 스킬 호출 없음"
+                        )
+                        await broadcaster.emit(
+                            "system",
+                            "⛔ 이메일 전송을 차단했습니다. 먼저 MCP 기반 가이드/검색 스킬을 생성·호출하세요.",
+                            "[순서 가드]",
+                        )
+                        result = {
+                            "status": "blocked",
+                            "error": "이메일 본문 데이터가 준비되지 않았습니다.",
+                            "hint": (
+                                "사용자 요청에 '가이드/추천/검색/맛집/관광지/실내' 의도가 있습니다. "
+                                "이메일 전송 전에 반드시 MCP 기반 스킬(create_new_skill 후 해당 스킬 호출)로 "
+                                "실시간 데이터를 수집해야 합니다. "
+                                "지금 create_new_skill을 호출하여 가이드 스킬을 생성한 뒤, "
+                                "그 스킬로 실제 데이터를 조회하고, 그 결과를 이메일 body에 담아 "
+                                "send_email_via_smtp를 다시 호출하세요."
+                            ),
+                        }
+                        result_str = json.dumps(result, ensure_ascii=False, indent=2)
+                        brain.add_tool_result(tool_call["id"], result)
+                        logger.info(f"Tool result: {result_str}")
+                        memory.add_event("tool_result", {"name": tool_name, "result": result})
+                        continue
+
+                if tool_name == "propose_care_automation":
+                    if _has_email_intent:
+                        # 최근 send_email_via_smtp 호출 결과가 성공인지 확인
+                        _email_ok = False
+                        _email_call_id = None
+                        _last_call_idx = -1
+                        for _i, _m in enumerate(brain._messages):
+                            if _m.get("role") == "assistant":
+                                for _tc in (_m.get("tool_calls") or []):
+                                    if (_tc.get("function") or {}).get("name") == "send_email_via_smtp":
+                                        _last_call_idx = _i
+                                        _email_call_id = _tc.get("id")
+                        if _last_call_idx >= 0:
+                            for _m in brain._messages[_last_call_idx + 1:]:
+                                if _m.get("role") == "tool" and _m.get("tool_call_id") == _email_call_id:
+                                    try:
+                                        _r = json.loads(_m.get("content") or "{}")
+                                    except Exception:
+                                        _r = {}
+                                    if isinstance(_r, dict) and not _r.get("error") \
+                                            and not _r.get("env_key_required"):
+                                        _email_ok = True
+                                    break
+                        if not _email_ok:
+                            logger.warning(
+                                "[Order-Guard] propose_care_automation 호출 차단 — send_email_via_smtp 성공 결과 없음"
+                            )
+                            await broadcaster.emit(
+                                "system",
+                                "⛔ 자동화 등록 질문을 차단했습니다. 이메일 전송을 먼저 성공시켜야 합니다.",
+                                "[순서 가드]",
+                            )
+                            # propose_care_automation 호출을 실제 실행하지 않고 LLM에게 에러 응답 주입
+                            result = {
+                                "status": "blocked",
+                                "error": "이메일 전송이 먼저 성공해야 합니다.",
+                                "hint": (
+                                    "지금 send_email_via_smtp를 호출하여 이메일을 전송하세요. "
+                                    "SMTP_PASSWORD 미설정이면 사장님께 안내 후 '설정 완료' 응답을 기다리세요. "
+                                    "이메일 전송이 성공한 다음에만 propose_care_automation을 호출할 수 있습니다."
+                                ),
+                            }
+                            result_str = json.dumps(result, ensure_ascii=False, indent=2)
+                            brain.add_tool_result(tool_call["id"], result)
+                            logger.info(f"Tool result: {result_str}")
+                            memory.add_event("tool_result", {"name": tool_name, "result": result})
+                            continue
 
                 # Tool 실행
                 result = await execute(tool_name, tool_args)
@@ -1055,6 +1380,19 @@ async def chat(request: Request):
 
     logger.info(f"Chat command received: {user_message}")
 
+    # ── 대시보드 버튼 callback → handle_telegram_message로 위임 ──
+    # 텔레그램 인라인 버튼과 대시보드 버튼은 동일한 텍스트(callback_data 또는 라벨)를 보냄.
+    # care_*/auto_rule_*/"자동화 등록"/"등록 안함" 등은 handle_telegram_message에서 처리 로직이 있다.
+    _norm = user_message.strip().lstrip("✅❌📋🔧").strip().strip("[]").strip()
+    _is_callback = (
+        user_message.startswith("care_")
+        or user_message.startswith("auto_rule_")
+        or _norm in ("자동화 등록", "등록 안함", "자동화 안함", "Yes", "No", "등록")
+    )
+    if _is_callback:
+        await handle_telegram_message(user_message, chat_id="dashboard")
+        return {"response": ""}
+
     # 에이전트 루프 실행 (트리거 이벤트를 채팅 메시지로 설정)
     event = {
         "event": "user_command",
@@ -1062,6 +1400,27 @@ async def chat(request: Request):
         "source": "dashboard_chat",
         "message": user_message
     }
+
+    # ── 투숙객/예약 관련 키워드 감지 시 현재 예약 정보를 자동 주입 ──
+    # Agent가 guest_email을 몰라서 "이메일 주소를 알려주세요"라고 되묻는 문제 방지
+    _guest_keywords = ["투숙객", "게스트", "손님", "이메일", "메일", "예약", "booking", "guest"]
+    if any(kw in user_message.lower() for kw in _guest_keywords):
+        try:
+            import httpx as _httpx
+            _site_a_url = os.getenv("SITE_A_URL", "http://localhost:8001")
+            async with _httpx.AsyncClient(timeout=3.0) as _client:
+                _resp = await _client.get(f"{_site_a_url}/bookings")
+                if _resp.status_code == 200:
+                    _bookings = _resp.json().get("bookings", []) or []
+                    if _bookings:
+                        event["current_bookings"] = _bookings
+                        await broadcaster.emit(
+                            "system",
+                            f"📋 현재 예약 {len(_bookings)}건을 컨텍스트에 주입했습니다.",
+                            "[예약 컨텍스트]",
+                        )
+        except Exception as _e:
+            logger.debug(f"Booking context inject skipped: {_e}")
 
     # ── Proactive Care: 키워드 감지 ──
     care_engine = get_care_engine()
@@ -1299,26 +1658,36 @@ async def dashboard():
         .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 60vh; color: #94a3b8; gap: 1rem; }
         .empty-state .icon { font-size: 3rem; }
 
+        /* ── Left Sidebar ── */
+        .left-sidebar {
+            width: 240px; flex-shrink: 0;
+            display: flex; flex-direction: column;
+            background: #ffffff; border-right: 1px solid #e2e8f0;
+            overflow: hidden;
+        }
+
         /* ── Skill Library Panel ── */
         .skill-library-panel {
-            background: #ffffff; border-top: 1px solid #e2e8f0;
+            background: #ffffff; display: flex; flex-direction: column;
+            flex: 1 1 50%; min-height: 0; overflow: hidden;
+            border-bottom: 1px solid #e2e8f0;
         }
         .skill-library-header {
-            padding: 0.5rem 1.5rem; font-size: 0.78rem; font-weight: 700;
+            padding: 0.5rem 1rem; font-size: 0.78rem; font-weight: 700;
             color: #16a34a; display: flex; align-items: center; justify-content: space-between;
             border-bottom: 1px solid #e2e8f0; background: rgba(22,163,74,0.03);
-            cursor: pointer; user-select: none; transition: background 0.2s;
+            cursor: pointer; user-select: none; transition: background 0.2s; flex-shrink: 0;
         }
         .skill-library-header:hover { background: rgba(22,163,74,0.06); }
         .skill-cards {
-            display: flex; flex-wrap: wrap; gap: 0.5rem; padding: 0.6rem 1.2rem;
-            max-height: 120px; overflow-y: auto;
+            display: flex; flex-direction: column; gap: 0.4rem;
+            padding: 0.5rem 0.8rem; overflow-y: auto; flex: 1; min-height: 0;
         }
         .skill-card {
             background: rgba(22,163,74,0.05); border: 1px solid rgba(22,163,74,0.2);
-            border-radius: 8px; padding: 0.35rem 0.7rem; font-size: 0.7rem;
+            border-radius: 8px; padding: 0.35rem 0.6rem; font-size: 0.7rem;
             display: flex; flex-direction: column; gap: 0.1rem;
-            animation: fadeIn 0.4s ease-out; min-width: 140px; max-width: 220px;
+            animation: fadeIn 0.4s ease-out; width: 100%; box-sizing: border-box;
         }
         .skill-card-name { color: #16a34a; font-weight: 700; }
         .skill-card-desc { color: #64748b; font-size: 0.62rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -1333,26 +1702,30 @@ async def dashboard():
 
         /* ── Active Rules Panel ── */
         .rules-panel {
-            background: #ffffff; border-top: 1px solid #e2e8f0;
+            background: #ffffff; display: flex; flex-direction: column;
+            flex: 1 1 50%; min-height: 0; overflow: hidden;
         }
         .rules-header {
-            padding: 0.5rem 1.5rem; font-size: 0.78rem; font-weight: 700;
+            padding: 0.5rem 1rem; font-size: 0.78rem; font-weight: 700;
             color: #d97706; display: flex; align-items: center; justify-content: space-between;
             border-bottom: 1px solid #e2e8f0; background: rgba(217,119,6,0.03);
-            cursor: pointer; user-select: none; transition: background 0.2s;
+            cursor: pointer; user-select: none; transition: background 0.2s; flex-shrink: 0;
         }
         .rules-header:hover { background: rgba(217,119,6,0.06); }
         .rules-cards {
-            display: flex; flex-wrap: wrap; gap: 0.5rem; padding: 0.6rem 1.2rem;
-            max-height: 140px; overflow-y: auto;
+            display: flex; flex-direction: column; gap: 0.4rem;
+            padding: 0.5rem 0.8rem; overflow-y: auto; flex: 1; min-height: 0;
         }
         .rule-card {
             background: rgba(217,119,6,0.04); border: 1px solid rgba(217,119,6,0.2);
-            border-radius: 8px; padding: 0.4rem 0.7rem; font-size: 0.7rem;
+            border-radius: 8px; padding: 0.4rem 0.6rem; font-size: 0.7rem;
             display: flex; flex-direction: column; gap: 0.15rem;
-            animation: fadeIn 0.4s ease-out; min-width: 180px; max-width: 280px;
+            animation: fadeIn 0.4s ease-out; width: 100%; box-sizing: border-box;
         }
-        .rule-card-action { color: #92400e; font-weight: 700; font-size: 0.72rem; }
+        .rule-card-action {
+            color: #92400e; font-weight: 700; font-size: 0.72rem;
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
         .rule-card-trigger { color: #64748b; font-size: 0.62rem; }
         .rule-card-meta { color: #94a3b8; font-size: 0.58rem; display: flex; gap: 0.5rem; align-items: center; }
         .rule-badge-auto { background: rgba(22,163,74,0.12); color: #16a34a; padding: 0.05rem 0.35rem; border-radius: 6px; font-size: 0.55rem; font-weight: 700; }
@@ -1413,7 +1786,25 @@ async def dashboard():
     </div>
 
     <div class="main-content">
-        <!-- Chat Sidebar -->
+        <!-- Left Sidebar: Skill Library + Active Rules -->
+        <aside class="left-sidebar">
+            <div class="skill-library-panel" id="skillLibraryPanel">
+                <div class="skill-library-header" onclick="toggleSkillPanel()">
+                    <span>🧩 Skills <span id="skillCount">0</span></span>
+                    <span class="toggle-icon" id="skillToggleIcon" style="font-size:0.6rem;">▼</span>
+                </div>
+                <div class="skill-cards" id="skillCards" style="display:flex;"></div>
+            </div>
+            <div class="rules-panel" id="rulesPanel">
+                <div class="rules-header" onclick="toggleRulesPanel()">
+                    <span>⚡ Rules <span id="rulesCount">0</span></span>
+                    <span class="toggle-icon" id="rulesToggleIcon" style="font-size:0.6rem;">▼</span>
+                </div>
+                <div class="rules-cards" id="rulesCards" style="display:flex;"></div>
+            </div>
+        </aside>
+
+        <!-- Chat Main -->
         <div class="chat-panel" id="chatPanel">
             <div class="chat-header">💬 Agent Command Center</div>
             <div class="chat-body" id="chatBody">
@@ -1425,24 +1816,6 @@ async def dashboard():
                 <button class="chat-btn" style="background:transparent; border:1px solid #d1d5db; color:#64748b; font-size:0.6rem;" onclick="clearLogs()">로그 초기화</button>
             </div>
         </div>
-    </div>
-
-    <!-- Skill Library Panel -->
-    <div class="skill-library-panel" id="skillLibraryPanel">
-        <div class="skill-library-header" onclick="toggleSkillPanel()">
-            <span>🧩 Skill Library — 등록된 스킬 <span id="skillCount">0</span>개</span>
-            <span class="toggle-icon" id="skillToggleIcon" style="font-size:0.6rem;">▼</span>
-        </div>
-        <div class="skill-cards" id="skillCards" style="display:flex;"></div>
-    </div>
-
-    <!-- Active Rules Panel -->
-    <div class="rules-panel" id="rulesPanel">
-        <div class="rules-header" onclick="toggleRulesPanel()">
-            <span>⚡ Active Rules — 자동화 규칙 <span id="rulesCount">0</span>개</span>
-            <span class="toggle-icon" id="rulesToggleIcon" style="font-size:0.6rem;">▼</span>
-        </div>
-        <div class="rules-cards" id="rulesCards" style="display:flex;"></div>
     </div>
 
     <div class="footer">
@@ -1509,6 +1882,78 @@ async def dashboard():
 
         function escapeHtml(t) { const d = document.createElement('div'); d.textContent = t; return d.innerHTML; }
 
+        // ── 에이전트 → 대시보드 버튼 프롬프트 렌더링 ──
+        function appendAgentPrompt(message, buttons) {
+            const wrap = document.createElement('div');
+            wrap.className = 'chat-msg msg-agent';
+            const text = document.createElement('div');
+            text.innerHTML = escapeHtml(message || '')
+                .replace(/\\n/g, '<br>')
+                .replace(/  /g, '&nbsp; ');
+            wrap.appendChild(text);
+            if (buttons && buttons.length) {
+                const btnRow = document.createElement('div');
+                btnRow.style.cssText =
+                    'display:flex;flex-direction:column;gap:0.4rem;margin-top:0.6rem;align-items:stretch;';
+                buttons.forEach(label => {
+                    const b = document.createElement('button');
+                    b.textContent = label;
+                    b.title = label;   // 말줄임 시 마우스 호버로 전체 텍스트 확인
+                    b.style.cssText =
+                        'display:block;width:100%;min-width:0;max-width:100%;'
+                      + 'padding:0.55rem 0.9rem;font-size:0.82rem;'
+                      + 'border:1px solid #c4b5fd;background:#f5f3ff;color:#6d28d9;'
+                      + 'border-radius:10px;cursor:pointer;text-align:left;'
+                      + 'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;'
+                      + 'box-sizing:border-box;';
+                    b.onclick = () => {
+                        // 버튼 클릭 → 채팅창에 사용자 메시지로 반영 + /chat 전송
+                        appendChatMessage('user', label);
+                        statusText.textContent = '처리 중...';
+                        statusDot.style.background = '#f59e0b';
+                        Array.from(btnRow.children).forEach(el => el.disabled = true);
+                        fetch('/chat', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ message: label })
+                        })
+                        .then(r => r.json())
+                        .then(data => {
+                            if (data.response) appendChatMessage('agent', data.response);
+                        })
+                        .catch(() => appendChatMessage('agent', '에러: 서버와 통신할 수 없습니다.'))
+                        .finally(() => {
+                            statusText.textContent = '대기 중';
+                            statusDot.style.background = '#3fb950';
+                        });
+                    };
+                    btnRow.appendChild(b);
+                });
+                wrap.appendChild(btnRow);
+            }
+            chatBody.appendChild(wrap);
+            chatBody.scrollTop = chatBody.scrollHeight;
+        }
+
+        // ── SSE 구독: 외부 트리거 결과 + 에이전트 프롬프트 ──
+        try {
+            const eventSource = new EventSource('/logs/stream');
+            eventSource.onmessage = (e) => {
+                try {
+                    const entry = JSON.parse(e.data);
+                    if (entry.type === 'external_result') {
+                        appendChatMessage('agent', entry.content || '');
+                        statusText.textContent = '대기 중';
+                        statusDot.style.background = '#3fb950';
+                    } else if (entry.type === 'dashboard_prompt') {
+                        const payload = JSON.parse(entry.content || '{}');
+                        appendAgentPrompt(payload.message || '', payload.buttons || []);
+                    }
+                } catch (err) { /* ignore malformed events */ }
+            };
+            eventSource.onerror = () => { /* auto reconnect */ };
+        } catch (err) { console.warn('SSE subscription failed', err); }
+
         // Skill Library
         function toggleSkillPanel() {
             const cards = document.getElementById('skillCards');
@@ -1519,6 +1964,45 @@ async def dashboard():
             if (isHidden) loadSkills();
         }
 
+        // ── 기술 용어 → 사장님이 이해하기 쉬운 한글 라벨 매핑 ──
+        const SKILL_LABEL_MAP = {
+            send_email_via_smtp:              { icon: '✉️', name: '이메일 발송' },
+            generate_local_guide:             { icon: '📍', name: '지역 가이드 만들기' },
+            recommend_indoor_places:          { icon: '🏠', name: '실내 명소 추천' },
+            generate_indoor_places_guide:     { icon: '🏠', name: '실내 명소 가이드' },
+            generate_personalized_travel_guidebook: { icon: '📖', name: '맞춤 여행 가이드' },
+            create_indoor_activity_guide:     { icon: '🏠', name: '실내 체험 가이드' },
+            search_indoor_hotplaces:          { icon: '🔍', name: '실내 핫플 검색' },
+            create_travel_guide:              { icon: '📖', name: '여행 가이드 제작' },
+        };
+        const SKILL_VERB_HINT = [
+            { re: /email|mail|smtp/i,           icon: '✉️', hint: '이메일' },
+            { re: /guide|guidebook/i,           icon: '📖', hint: '가이드' },
+            { re: /indoor|실내/i,               icon: '🏠', hint: '실내 장소' },
+            { re: /place|location|poi|map/i,    icon: '📍', hint: '장소 검색' },
+            { re: /weather|rain|snow/i,         icon: '🌦️', hint: '날씨' },
+            { re: /search|recommend/i,          icon: '🔍', hint: '검색·추천' },
+        ];
+        function prettifySkill(name) {
+            if (SKILL_LABEL_MAP[name]) return SKILL_LABEL_MAP[name];
+            for (const h of SKILL_VERB_HINT) {
+                if (h.re.test(name)) {
+                    return { icon: h.icon, name: h.hint };
+                }
+            }
+            // 폴백: snake_case → 공백 구분 + 단어 첫글자 대문자
+            const pretty = name.replace(/_/g, ' ').replace(/\\b\\w/g, c => c.toUpperCase());
+            return { icon: '⚡', name: pretty };
+        }
+        function prettifyService(service) {
+            if (!service) return '';
+            if (/google-maps|google_maps|maps/i.test(service)) return '🗺️ Google 지도';
+            if (/gmail|smtp/i.test(service))                   return '✉️ 이메일 (Gmail)';
+            if (/modelcontextprotocol\\/server-(\\w+)/i.test(service)) return '🔌 MCP 서버';
+            if (/smithery/i.test(service))                     return '🔌 Smithery';
+            return '🔌 외부 서비스';
+        }
+
         function loadSkills() {
             fetch('/skills')
                 .then(r => r.json())
@@ -1527,17 +2011,18 @@ async def dashboard():
                     document.getElementById('skillCount').textContent = skills.length;
                     const cards = document.getElementById('skillCards');
                     if (skills.length === 0) {
-                        cards.innerHTML = '<span class="skill-empty">📭 저장된 스킬 없음 — 대화창에서 새 기능을 요청하면 자동 생성됩니다.</span>';
+                        cards.innerHTML = '<span class="skill-empty">아직 만들어진 기능이 없습니다. 대화창에 필요한 작업을 말씀하시면 자동으로 준비됩니다.</span>';
                         return;
                     }
-                    cards.innerHTML = skills.map(s =>
-                        `<div class="skill-card">
-                            <span class="skill-card-name">⚡ ${escapeHtml(s.name)}</span>
-                            <span class="skill-card-desc">${escapeHtml(s.description || '')}</span>
-                            <span class="skill-card-service">🔧 ${escapeHtml(s.service || '')}</span>
-                            <button class="skill-card-delete" onclick="deleteSkill('${escapeHtml(s.name)}')" title="스킬 삭제">🗑️ 삭제</button>
-                        </div>`
-                    ).join('');
+                    cards.innerHTML = skills.map(s => {
+                        const pretty = prettifySkill(s.name);
+                        const serviceLabel = prettifyService(s.service);
+                        return `<div class="skill-card" title="${escapeHtml(s.name)}">
+                            <span class="skill-card-name">${pretty.icon} ${escapeHtml(pretty.name)}</span>
+                            ${serviceLabel ? `<span class="skill-card-service">${serviceLabel}</span>` : ''}
+                            <button class="skill-card-delete" onclick="deleteSkill('${escapeHtml(s.name)}')" title="기능 삭제">🗑️ 삭제</button>
+                        </div>`;
+                    }).join('');
                 })
                 .catch(() => {});
         }
@@ -1570,6 +2055,17 @@ async def dashboard():
             if (isHidden) loadRules();
         }
 
+        const TRIGGER_LABEL = {
+            rain:       '🌧️ 비 올 때',
+            heavy_rain: '⛈️ 폭우 올 때',
+            snow:       '❄️ 눈 올 때',
+            wind:       '🌬️ 강풍 불 때',
+            heat:       '🔥 폭염 일 때',
+            cold:       '🥶 한파 일 때',
+            general:    '🌦️ 날씨 변할 때',
+        };
+        function prettifyTrigger(cat) { return TRIGGER_LABEL[cat] || ('🌦️ ' + (cat || '이벤트')); }
+
         function loadRules() {
             fetch('/care/rules')
                 .then(r => r.json())
@@ -1578,20 +2074,23 @@ async def dashboard():
                     document.getElementById('rulesCount').textContent = rules.length;
                     const cards = document.getElementById('rulesCards');
                     if (rules.length === 0) {
-                        cards.innerHTML = '<span class="rules-empty">등록된 자동화 규칙 없음</span>';
+                        cards.innerHTML = '<span class="rules-empty">등록된 자동화가 없습니다. 케어 제안을 승인하면 여기에 추가됩니다.</span>';
                         return;
                     }
                     cards.innerHTML = rules.map(r => {
                         const badge = r.auto_execute
-                            ? '<span class="rule-badge-auto">AUTO</span>'
-                            : '<span class="rule-badge-manual">MANUAL</span>';
-                        return `<div class="rule-card">
+                            ? '<span class="rule-badge-auto">자동</span>'
+                            : '<span class="rule-badge-manual">승인</span>';
+                        const trigger = prettifyTrigger(r.trigger_category);
+                        const skillPretty = r.skill_name ? prettifySkill(r.skill_name) : null;
+                        const skillLine = skillPretty
+                            ? `사용 기능: ${skillPretty.icon} ${escapeHtml(skillPretty.name)}`
+                            : '';
+                        return `<div class="rule-card" title="${escapeHtml(r.action || '')}">
                             <span class="rule-card-action">${badge} ${escapeHtml(r.action || '')}</span>
-                            <span class="rule-card-trigger">트리거: ${escapeHtml(r.trigger_category || '')} | 승인: ${r.approval_count || 0}회</span>
-                            <span class="rule-card-meta">
-                                ${r.skill_name ? '스킬: ' + escapeHtml(r.skill_name) : ''}
-                            </span>
-                            <button class="rule-card-delete" onclick="deleteRule('${escapeHtml(r.id)}')" title="규칙 삭제">🗑️ 삭제</button>
+                            <span class="rule-card-trigger">${trigger} · 승인 ${r.approval_count || 0}회</span>
+                            ${skillLine ? `<span class="rule-card-meta">${skillLine}</span>` : ''}
+                            <button class="rule-card-delete" onclick="deleteRule('${escapeHtml(r.id)}')" title="자동화 삭제">🗑️ 삭제</button>
                         </div>`;
                     }).join('');
                 })
@@ -1662,8 +2161,30 @@ async def webhook(request: Request):
         event = await request.json()
         logger.info(f"Webhook received: {json.dumps(event, ensure_ascii=False)}")
 
+        # ── 새 예약 Webhook → 대시보드에 간단 알림 ──
+        if event.get("event") == "booking_confirmed":
+            _b = event.get("booking", {}) or {}
+            _guest = _b.get("guest_name") or "?"
+            _email = _b.get("guest_email") or ""
+            _room = _b.get("room_id") or "?"
+            _ci = _b.get("check_in") or "?"
+            _co = _b.get("check_out") or "?"
+            _lines = [
+                f"[🏨 Site A] 새 예약 접수",
+                f"• 투숙객: {_guest}" + (f" ({_email})" if _email else ""),
+                f"• 객실: {_room}",
+                f"• 기간: {_ci} ~ {_co}",
+            ]
+            await broadcaster.emit(
+                "external_result",
+                "\n".join(_lines),
+                "🏨 예약 접수",
+            )
+            # 이후 agent loop는 Site B 동기화를 조용히 수행 — 최종 요약 중복 방지
+            event["_skip_dashboard_echo"] = True
+
         # ── 날씨 변경 Webhook → Proactive Care 트리거 ──
-        if event.get("event") == "weather_changed":
+        elif event.get("event") == "weather_changed":
             weather_info = event.get("weather", {})
             affected = event.get("affected_bookings", [])
             new_condition = weather_info.get("current", "")
@@ -1696,25 +2217,27 @@ async def webhook(request: Request):
                         "analysis": care_result["analysis"],
                     }
                     # save_pending_proposals 호출 안함 (버튼 없으므로 불필요)
-                    if telegram_client.token and telegram_client.user_id:
-                        auto_names = "\n".join(
-                            f"  • {a['action']}" for a in care_result["auto_actions"]
-                        )
-                        await telegram_client.send_message(
-                            f"⚡ <b>자동 실행 규칙 감지</b>\n{auto_names}\n\n"
-                            f"자동으로 실행 중입니다. 완료 후 결과를 보고드리겠습니다.",
-                            parse_mode="HTML",
-                        )
+                    auto_names = "\n".join(
+                        f"  • {a['action']}" for a in care_result["auto_actions"]
+                    )
+                    await telegram_client.send_message(
+                        f"⚡ <b>자동 실행 규칙 감지</b>\n{auto_names}\n\n"
+                        f"자동으로 실행 중입니다. 완료 후 결과를 보고드리겠습니다.",
+                        parse_mode="HTML",
+                    )
+                    event["_skip_dashboard_echo"] = True
                 else:
                     # ── Manual path: 기존 제안 + 승인 버튼 플로우 ──
                     save_pending_proposals(care_result["analysis"], affected_bookings=affected)
-                    if telegram_client.token and telegram_client.user_id:
-                        tg_msg = care_engine.format_care_telegram_message(care_result["analysis"])
-                        await telegram_client.send_message(
-                            tg_msg,
-                            parse_mode="HTML",
-                            reply_markup=care_result["telegram_buttons"],
-                        )
+                    tg_msg = care_engine.format_care_telegram_message(care_result["analysis"])
+                    # 텔레그램 token/user_id와 무관하게 전송 시도 — 대시보드 브로드캐스트는 항상 수행됨
+                    await telegram_client.send_message(
+                        tg_msg,
+                        parse_mode="HTML",
+                        reply_markup=care_result["telegram_buttons"],
+                    )
+                    # 이미 대시보드에 케어 제안 카드가 갔으니 run_agent_loop의 최종 요약은 중복 전송 방지
+                    event["_skip_dashboard_echo"] = True
 
             result = await run_agent_loop(event)
             return JSONResponse(content=result)

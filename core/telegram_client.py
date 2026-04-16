@@ -1,8 +1,45 @@
 import os
+import re
+import json
+import time
+import hashlib
 import logging
 import httpx
 import asyncio
 from typing import Optional
+
+
+# 짧은 시간 내 동일 메시지 중복 dashboard broadcast 방지용 (최대 32건, TTL 10초)
+_RECENT_BROADCAST: list[tuple[str, float]] = []
+_DEDUP_TTL = 10.0
+
+
+def _is_duplicate_broadcast(text: str) -> bool:
+    """같은 텍스트가 최근 _DEDUP_TTL초 내에 broadcast되었으면 True."""
+    now = time.time()
+    h = hashlib.sha1((text or "").encode("utf-8")).hexdigest()
+    # 만료된 항목 제거
+    _RECENT_BROADCAST[:] = [(k, t) for (k, t) in _RECENT_BROADCAST if now - t < _DEDUP_TTL]
+    for k, _ in _RECENT_BROADCAST:
+        if k == h:
+            return True
+    _RECENT_BROADCAST.append((h, now))
+    if len(_RECENT_BROADCAST) > 32:
+        _RECENT_BROADCAST.pop(0)
+    return False
+
+
+def _strip_html_tags(text: str) -> str:
+    """텔레그램 HTML 태그(<b>, <i>, <code>, <a>, <br> 등)를 제거해 평문으로 변환."""
+    if not text:
+        return ""
+    # <br> 계열은 줄바꿈으로
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    # <a href="...">라벨</a> → "라벨"만 유지
+    text = re.sub(r"<a\s[^>]*>(.*?)</a>", r"\1", text, flags=re.IGNORECASE | re.DOTALL)
+    # 나머지 태그 제거
+    text = re.sub(r"</?[a-zA-Z][^>]*>", "", text)
+    return text
 
 logger = logging.getLogger(__name__)
 
@@ -11,11 +48,16 @@ class TelegramClient:
         self.token = token or os.getenv("TELEGRAM_BOT_TOKEN")
         self.user_id = user_id or os.getenv("TELEGRAM_USER_ID")
         self.base_url = f"https://api.telegram.org/bot{self.token}" if self.token else None
+        # 운영 플래그: .env에 TELEGRAM_ENABLED=false 로 설정하면 전송·폴링 모두 중단
+        self.enabled = os.getenv("TELEGRAM_ENABLED", "true").strip().lower() != "false"
         self._is_polling = False
         self._last_update_id = 0
 
     async def send_message(self, text: str, user_id: Optional[str] = None, reply_markup: Optional[dict] = None, parse_mode: Optional[str] = None) -> dict:
         """텔레그램 메시지 전송 (버튼 포함 가능).
+
+        TELEGRAM_ENABLED 플래그와 무관하게 대시보드 채팅창에도 동일 메시지를 푸시한다.
+        (enabled=false 면 텔레그램 전송은 생략되고 대시보드로만 간다.)
 
         Args:
             text: 메시지 본문
@@ -23,6 +65,37 @@ class TelegramClient:
             reply_markup: 인라인 키보드 등
             parse_mode: "HTML" 또는 "MarkdownV2" (생략 시 plain text)
         """
+        # ── 대시보드 브로드캐스트 (모든 호출에서 단일 관문) ──
+        try:
+            from core.engine import broadcaster
+            buttons: list = []
+            if reply_markup and isinstance(reply_markup, dict):
+                for row in reply_markup.get("inline_keyboard", []) or []:
+                    for btn in row or []:
+                        label = (btn.get("text") if isinstance(btn, dict) else None) \
+                                or (btn.get("callback_data") if isinstance(btn, dict) else None)
+                        if label:
+                            buttons.append(str(label))
+            # 텔레그램 HTML 태그(<b>, <i> 등)는 대시보드에 평문으로 노출되므로 제거
+            _dashboard_text = _strip_html_tags(text) if (parse_mode or "").upper() == "HTML" else text
+            # 짧은 시간 내(10초) 같은 메시지가 이미 broadcast되었다면 중복 카드 방지
+            _dedup_key = _dashboard_text + "||" + json.dumps(buttons, ensure_ascii=False, sort_keys=True)
+            if _is_duplicate_broadcast(_dedup_key):
+                logger.info("Dashboard broadcast deduplicated (동일 메시지 10초 내 중복)")
+            else:
+                payload = {"message": _dashboard_text, "buttons": buttons}
+                await broadcaster.emit(
+                    "dashboard_prompt",
+                    json.dumps(payload, ensure_ascii=False),
+                    "대시보드 프롬프트",
+                )
+        except Exception as e:
+            logger.debug(f"Dashboard broadcast skipped: {e}")
+
+        # ── 텔레그램 전송 ──
+        if not self.enabled:
+            return {"status": "skipped", "reason": "TELEGRAM_ENABLED=false"}
+
         if not self.token:
             return {"error": "TELEGRAM_BOT_TOKEN is not set"}
 
@@ -48,6 +121,9 @@ class TelegramClient:
 
     async def start_polling(self, message_callback):
         """백그라운드에서 텔레그램 메시지 수신 (Long Polling)."""
+        if not self.enabled:
+            logger.info("Telegram disabled via TELEGRAM_ENABLED=false. Polling skipped.")
+            return
         if not self.token:
             logger.warning("Telegram token not set. Polling disabled.")
             return
