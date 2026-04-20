@@ -578,7 +578,12 @@ async def partial():
 
 @app.get("/bookings")
 async def list_bookings():
-    return {"bookings": [b.model_dump() for b in bookings.values()]}
+    return {
+        "bookings": [b.model_dump() for b in bookings.values()],
+        "property_lat": PROPERTY_LAT,
+        "property_lng": PROPERTY_LNG,
+        "property_location": PROPERTY_LOCATION,
+    }
 
 
 @app.post("/bookings")

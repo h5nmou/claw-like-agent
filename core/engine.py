@@ -59,6 +59,10 @@ onboarding_mgr = OnboardingManager()
 # 새 에이전트 루프에서도 원본 요청(이메일 전송 등)을 이어서 처리한다.
 _pending_original_context = None  # type: dict | None
 
+# /chat 세션용 Brain — 대화 히스토리를 유지하여 이전 대화를 기억한다.
+# webhook 이벤트는 별도 Brain을 사용하므로 채팅 히스토리에 영향 없음.
+_chat_brain: "Brain | None" = None
+
 # Phone-MCP 설정
 # PHONE_MCP_ENABLED=false 로 설정하면 연결 시도를 완전히 생략한다.
 PHONE_MCP_ENABLED = os.getenv("PHONE_MCP_ENABLED", "true").strip().lower() != "false"
@@ -559,19 +563,21 @@ def load_all_scenes(directory: str) -> str:
 MAX_LOOP_ITERATIONS = 10  # 무한 루프 방지
 
 
-async def run_agent_loop(trigger_event: dict) -> dict:
+async def run_agent_loop(trigger_event: dict, session_brain: "Brain | None" = None) -> dict:
     """
     하나의 트리거 이벤트에 대해 Perceive → Reason → Act 루프를 실행.
+
+    session_brain: 외부에서 주입된 세션 Brain (대화 히스토리 유지용).
+                   None이면 매번 새 Brain 생성 (webhook 등 독립 이벤트).
     """
     # ── Phase 1: Scene 로드 ──
     await broadcaster.emit("divider", "PHASE 1 — Scene 로드", "")
     await broadcaster.emit("system", f"📂 Scene 디렉토리({SCENE_DIR}) 로드 중...", "⚙️ 초기화")
     system_prompt = load_all_scenes(SCENE_DIR)
-    
-    # 로드된 씬 목록 확인용 로그
+
     scene_list = [p.name for p in Path(SCENE_DIR).glob("*.md")]
     await broadcaster.emit("system", f"✅ 로드된 시나리오: {', '.join(scene_list)}", "⚙️ Scene 로드")
-    
+
     scene_preview = system_prompt[:500] + ("..." if len(system_prompt) > 500 else "")
     await broadcaster.emit("scene", scene_preview, "📜 Composite System Prompt")
 
@@ -591,14 +597,25 @@ async def run_agent_loop(trigger_event: dict) -> dict:
             "🔧 Tool 등록"
         )
 
-    # ── Phase 3: Brain 초기화 ──
-    await broadcaster.emit("divider", "PHASE 3 — Brain(LLM) 초기화", "")
-    await broadcaster.emit(
-        "system",
-        f"Brain 초기화 완료\n• System Prompt: Scene 규칙 ({len(system_prompt)}자)\n• Tools: {tool_names} ({len(tool_schemas)}개)\n• Model: {os.getenv('OPENAI_MODEL', 'gemini-2.5-flash')}",
-        "🧠 Brain 초기화"
-    )
-    brain = Brain(system_prompt=system_prompt, tools_schema=tool_schemas)
+    # ── Phase 3: Brain 초기화 (세션 Brain이 있으면 재사용) ──
+    if session_brain is not None:
+        brain = session_brain
+        brain.update_system_prompt(system_prompt)
+        brain.update_tools(tool_schemas)
+        brain.trim_history()
+        await broadcaster.emit(
+            "system",
+            f"Brain 세션 유지 (히스토리 {brain.get_message_count()}건)\n• Tools: {len(tool_schemas)}개",
+            "🧠 Brain 세션"
+        )
+    else:
+        await broadcaster.emit("divider", "PHASE 3 — Brain(LLM) 초기화", "")
+        await broadcaster.emit(
+            "system",
+            f"Brain 초기화 완료\n• System Prompt: Scene 규칙 ({len(system_prompt)}자)\n• Tools: {tool_names} ({len(tool_schemas)}개)\n• Model: {os.getenv('OPENAI_MODEL', 'gemini-2.5-flash')}",
+            "🧠 Brain 초기화"
+        )
+        brain = Brain(system_prompt=system_prompt, tools_schema=tool_schemas)
     memory = Memory()
 
     logger.info(f"Agent loop started. Tools: {tool_names}")
@@ -984,6 +1001,27 @@ async def run_agent_loop(trigger_event: dict) -> dict:
                         break
 
             _real_action_ok = _email_ok if _email_intent else _other_action_succeeded
+
+            # ⛔ 핵심 스킬 생성 실패 시 전체 작업 실패로 간주 — propose 재촉 금지
+            # create_new_skill이 error/실패를 반환했으면 사용자 요청이 완료되지 않은 것
+            _create_skill_failed = False
+            for _m in brain._messages:
+                if _m.get("role") == "assistant":
+                    for _tc in (_m.get("tool_calls") or []):
+                        if (_tc.get("function") or {}).get("name") == "create_new_skill":
+                            _cid = _tc.get("id")
+                            for _rm in brain._messages:
+                                if _rm.get("role") == "tool" and _rm.get("tool_call_id") == _cid:
+                                    try:
+                                        _cr = json.loads(_rm.get("content") or "{}")
+                                    except Exception:
+                                        _cr = {}
+                                    if isinstance(_cr, dict) and (_cr.get("error") or not _cr.get("success")):
+                                        _create_skill_failed = True
+                                    break
+            if _create_skill_failed:
+                _real_action_ok = False
+
             _propose_nudged = getattr(brain, "_propose_nudged", False)
             # ⛔ 자동 실행 모드(이미 등록된 Active Rule 발동)에서는 propose 재촉 금지
             #    — 이미 등록된 규칙을 수행 중인데 또 등록 질문 띄우면 무한 반복
@@ -1166,6 +1204,39 @@ async def run_agent_loop(trigger_event: dict) -> dict:
                         continue
 
                 if tool_name == "propose_care_automation":
+                    # Order-Guard B-0: create_new_skill이 실패했으면 propose 차단
+                    # 핵심 스킬이 만들어지지 않았는데 자동화 등록을 질문하면 안 됨
+                    _skill_creation_ok = True
+                    for _m in brain._messages:
+                        if _m.get("role") == "assistant":
+                            for _tc in (_m.get("tool_calls") or []):
+                                if (_tc.get("function") or {}).get("name") == "create_new_skill":
+                                    _cid = _tc.get("id")
+                                    for _rm in brain._messages:
+                                        if _rm.get("role") == "tool" and _rm.get("tool_call_id") == _cid:
+                                            try:
+                                                _cr = json.loads(_rm.get("content") or "{}")
+                                            except Exception:
+                                                _cr = {}
+                                            if isinstance(_cr, dict) and (_cr.get("error") or not _cr.get("success")):
+                                                _skill_creation_ok = False
+                                            break
+                    if not _skill_creation_ok:
+                        logger.warning("[Order-Guard] propose_care_automation 차단 — create_new_skill 실패")
+                        result = {
+                            "status": "blocked",
+                            "error": "스킬 생성이 실패한 상태에서는 자동화 등록을 할 수 없습니다.",
+                            "hint": (
+                                "사용자 요청을 아직 완료하지 못했습니다. "
+                                "사장님께 실패 사유(API 키 필요 등)를 보고하고 안내만 하세요. "
+                                "propose_care_automation은 모든 작업이 성공한 뒤에만 호출하세요."
+                            ),
+                        }
+                        brain.add_tool_result(tool_call["id"], result)
+                        logger.info(f"Tool result: {json.dumps(result, ensure_ascii=False)}")
+                        memory.add_event("tool_result", {"name": tool_name, "result": result})
+                        continue
+
                     if _has_email_intent:
                         # 최근 send_email_via_smtp 호출 결과가 성공인지 확인
                         _email_ok = False
@@ -1403,7 +1474,11 @@ async def chat(request: Request):
 
     # ── 투숙객/예약 관련 키워드 감지 시 현재 예약 정보를 자동 주입 ──
     # Agent가 guest_email을 몰라서 "이메일 주소를 알려주세요"라고 되묻는 문제 방지
-    _guest_keywords = ["투숙객", "게스트", "손님", "이메일", "메일", "예약", "booking", "guest"]
+    _guest_keywords = [
+        "투숙객", "게스트", "손님", "이메일", "메일", "예약", "booking", "guest",
+        "날씨", "별보기", "주변", "관광", "맛집", "카페", "가이드", "핫플",
+        "숙소", "위치", "좌표",
+    ]
     if any(kw in user_message.lower() for kw in _guest_keywords):
         try:
             import httpx as _httpx
@@ -1411,27 +1486,33 @@ async def chat(request: Request):
             async with _httpx.AsyncClient(timeout=3.0) as _client:
                 _resp = await _client.get(f"{_site_a_url}/bookings")
                 if _resp.status_code == 200:
-                    _bookings = _resp.json().get("bookings", []) or []
+                    _data = _resp.json()
+                    _bookings = _data.get("bookings", []) or []
                     if _bookings:
                         event["current_bookings"] = _bookings
+                        # 숙소 좌표도 이벤트에 주입 — run_agent_loop의 _coords_context 로직이
+                        # 이 값을 프롬프트에 넣어서 LLM/Skill Factory가 위치를 정확히 사용하게 됨
+                        _plat = _data.get("property_lat")
+                        _plng = _data.get("property_lng")
+                        _ploc = _data.get("property_location", "")
+                        if _plat and _plng:
+                            event["lat"] = _plat
+                            event["lng"] = _plng
+                            if _ploc:
+                                event["location"] = _ploc
                         await broadcaster.emit(
                             "system",
-                            f"📋 현재 예약 {len(_bookings)}건을 컨텍스트에 주입했습니다.",
+                            f"📋 현재 예약 {len(_bookings)}건 + 숙소 좌표({_plat},{_plng})를 컨텍스트에 주입했습니다.",
                             "[예약 컨텍스트]",
                         )
         except Exception as _e:
             logger.debug(f"Booking context inject skipped: {_e}")
 
-    # ── Proactive Care: 키워드 감지 ──
-    care_engine = get_care_engine()
-    care_result = await care_engine.process_message(user_message)
-    if care_result:
-        event["proactive_care_context"] = care_result["analysis"]
-        if care_result["auto_actions"]:
-            event["proactive_care"] = {
-                "auto_actions": care_result["auto_actions"],
-                "analysis": care_result["analysis"],
-            }
+    # ── Proactive Care: /chat(대시보드 채팅)에서는 비활성화 ──
+    # 사장님이 직접 채팅으로 보낸 메시지는 "일반 명령"이지 선제적 케어 트리거가 아니다.
+    # 선제적 케어는 weather_changed webhook 등 자동 이벤트에서만 발동한다.
+    # 여기서 care_engine.process_message()를 호출하면 "날씨" 같은 키워드만으로도
+    # LLM이 "선제적 케어 분석 결과가 감지되었습니다"로 응답하는 오동작이 발생한다.
 
     # 원본 사용자 요청을 전역 컨텍스트에 보관
     # → 예약 확정(booking_confirmed) 등의 Webhook이 이 루프 실행 중에 발생하면,
@@ -1442,7 +1523,13 @@ async def chat(request: Request):
         "original_message": user_message,
     }
 
-    result = await run_agent_loop(event)
+    # ── 세션 Brain 유지: 이전 대화 히스토리를 기억하며 연속 대화 가능 ──
+    global _chat_brain
+    if _chat_brain is None:
+        _sys = load_all_scenes(SCENE_DIR)
+        _tools = build_function_schemas()
+        _chat_brain = Brain(system_prompt=_sys, tools_schema=_tools)
+    result = await run_agent_loop(event, session_brain=_chat_brain)
 
     # 루프 완료 후 컨텍스트 초기화
     _pending_original_context = None

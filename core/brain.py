@@ -109,15 +109,33 @@ class Brain:
 
     # ── 유틸리티 ─────────────────────────────────────
 
+    MAX_HISTORY_TURNS = 20
+
     def get_message_count(self) -> int:
         return len(self._messages)
 
     def update_tools(self, new_tools_schema: list[dict]) -> None:
-        """루프 중 새 스킬이 등록되면 Tool 목록을 즉시 갱신.
-        
-        다음 think() 호출 시 LLM이 업데이트된 도구 목록을 받게 됩니다.
-        """
+        """루프 중 새 스킬이 등록되면 Tool 목록을 즉시 갱신."""
         self._tools_schema = new_tools_schema
+
+    def update_system_prompt(self, new_prompt: str) -> None:
+        """Scene 재로드 시 system prompt만 교체. 대화 히스토리는 유지."""
+        if self._messages and self._messages[0].get("role") == "system":
+            self._messages[0] = {"role": "system", "content": new_prompt}
+        else:
+            self._messages.insert(0, {"role": "system", "content": new_prompt})
+        self._system_prompt = new_prompt
+
+    def trim_history(self) -> None:
+        """슬라이딩 윈도우: system prompt + 최근 MAX_HISTORY_TURNS 턴만 유지.
+        오래된 대화를 제거하여 토큰 한계 초과를 방지한다.
+        """
+        max_msgs = self.MAX_HISTORY_TURNS * 2 + 1  # system(1) + (user+assistant) * N
+        if len(self._messages) <= max_msgs:
+            return
+        system = self._messages[0]
+        recent = self._messages[-(self.MAX_HISTORY_TURNS * 2):]
+        self._messages = [system] + recent
 
     def reset(self, keep_system: bool = True) -> None:
         if keep_system:

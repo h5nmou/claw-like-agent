@@ -106,7 +106,7 @@ Weather/disaster keyword detected in user message → `ProactiveCareEngine.proce
 - **`_pending_original_context`** global injects user's original task into webhook events to prevent task abandonment after booking sync
 - **Prompt injection defense**: all `/chat` and `/webhook` inputs are scanned by `SkillSecurityGate.scan_user_input()` before processing
 - **LLM backend**: Gemini via OpenAI-compatible endpoint (`https://generativelanguage.googleapis.com/v1beta/openai/`). Single helper `core/llm_client.py` — `get_llm_client()`, `get_default_model()`, `get_maker_model()`, `get_user_model()`. To switch back to OpenAI, set `OPENAI_BASE_URL=""` (empty) and use `gpt-*` models.
-- **LATM models**: `SKILL_MAKER_MODEL` (default: gemini-2.5-pro) for code synthesis + peer review; `SKILL_USER_MODEL` (default: gemini-2.5-flash) for lightweight execution
+- **LATM models**: `SKILL_MAKER_MODEL` (default: claude-sonnet-4-5) for code synthesis + peer review — `MAKER_API_KEY` + `MAKER_BASE_URL`로 별도 LLM 엔드포인트 사용 가능; `SKILL_USER_MODEL` (default: gemini-2.5-flash) for lightweight execution
 - **Korean UI/commits**: project uses Korean for user-facing text and commit messages
 
 ## Environment

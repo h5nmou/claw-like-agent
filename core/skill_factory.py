@@ -59,7 +59,7 @@ async def _log(level: str, msg: str, meta: str = "") -> None:
 
 # ── LATM 모델 설정 ──────────────────────────────────────────
 
-from core.llm_client import get_llm_client, get_maker_model as _get_maker_model, get_user_model as _get_user_model  # noqa: E402
+from core.llm_client import get_llm_client, get_maker_client, get_maker_model as _get_maker_model, get_user_model as _get_user_model  # noqa: E402
 
 
 # ── API 탐색 ─────────────────────────────────────────────
@@ -888,8 +888,10 @@ MCP 레지스트리(Smithery.ai, Awesome-MCP) 검색 결과:
 }}"""
 
         try:
+            # APIDiscovery는 일반 클라이언트 + 일반 모델을 사용 (Maker 모델은 코드 합성 전용)
+            from core.llm_client import get_default_model
             response = await self._client.chat.completions.create(
-                model=_get_maker_model(),
+                model=get_default_model(),
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
             )
@@ -914,7 +916,7 @@ class CodeSynthesizer:
     """LATM Maker — 고성능 모델 기반 코드 생성기."""
 
     def __init__(self) -> None:
-        self._client = get_llm_client()
+        self._client = get_maker_client()  # Maker 전용 클라이언트 (Claude 등)
 
     @staticmethod
     def _format_mcp_tools_context(strategy: dict) -> str:
@@ -1723,7 +1725,7 @@ class PeerReviewer:
     """
 
     def __init__(self) -> None:
-        self._client = get_llm_client()
+        self._client = get_maker_client()  # Maker 전용 클라이언트 (Claude 등)
 
     async def review(self, code: str, skill_name: str, strategy: dict) -> dict:
         """
